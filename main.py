@@ -16,16 +16,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Берём секретный ключ из настроек сервера Render (безопасно для GitHub!)
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
-# Подключаем OpenRouter
 ai_client = AsyncOpenAI(
     base_url="https://openrouter.ai" + "/api/v1",
     api_key=OPENROUTER_API_KEY,
 )
 
-# Умный роутер бесплатных моделей OpenRouter
 FREE_MODEL = "openrouter/free"
 
 @app.get("/")
@@ -40,7 +37,6 @@ async def chat_completions(request: Request):
     model_name = body.get("model", "gpt-6-astra")
     is_stream = body.get("stream", False)
 
-    # Потоковый режим (печатает ответ по буквам в реальном времени)
     if is_stream:
         async def event_generator():
             try:
@@ -50,8 +46,8 @@ async def chat_completions(request: Request):
                     stream=True
                 )
                 async for chunk in stream:
-                    if chunk.choices and chunk.choices.delta.content:
-                        text_piece = chunk.choices.delta.content
+                    if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+                        text_piece = chunk.choices[0].delta.content
                         data = {
                             "id": "chatcmpl-krot-live",
                             "object": "chat.completion.chunk",
@@ -74,7 +70,6 @@ async def chat_completions(request: Request):
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
 
-    # Обычный режим (если стриминг выключен)
     response = await ai_client.chat.completions.create(
         model=FREE_MODEL,
         messages=messages,
@@ -87,7 +82,7 @@ async def chat_completions(request: Request):
         "model": model_name,
         "choices": [{
             "index": 0,
-            "message": {"role": "assistant", "content": response.choices.message.content},
+            "message": {"role": "assistant", "content": response.choices[0].message.content},
             "finish_reason": "stop"
         }]
     }
