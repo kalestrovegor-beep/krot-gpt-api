@@ -1,4 +1,3 @@
-import os
 import time
 import uuid
 import urllib.parse
@@ -9,9 +8,8 @@ from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="KROT GPT Multimodal API", version="2.0")
+app = FastAPI(title="KROT GPT Multimodal API", version="2.1")
 
-# Разрешаем запросы с любых доменов (обязательно для работы с Tilda)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,7 +18,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Хранилище статусов видео-задач
 video_tasks: Dict[str, Dict[str, Any]] = {}
 
 
@@ -31,7 +28,7 @@ class Message(BaseModel):
     content: str
 
 class ChatCompletionRequest(BaseModel):
-    model: Optional[str] = "gpt-4o-mini"
+    model: Optional[str] = "openai"
     messages: List[Message]
     temperature: Optional[float] = 0.7
 
@@ -55,7 +52,7 @@ class VideoGenerationRequest(BaseModel):
 async def health_check():
     return {
         "status": "online",
-        "service": "KROT GPT API",
+        "service": "KROT GPT API v2.1",
         "endpoints": [
             "/v1/chat/completions",
             "/v1/images/generations",
@@ -75,35 +72,54 @@ async def list_models():
     }
 
 
-# --- 1. ТЕКСТОВЫЙ ЧАТ (OpenAI-совместимый) ---
+# --- 1. ТЕКСТОВЫЙ ЧАТ (с резервированием и защитой от сбоев) ---
 
 async def get_free_llm_response(messages: List[Dict[str, str]]) -> str:
-    """
-    Отправляет запрос в бесплатный текстовый шлюз Pollinations Text API
-    (не требует платных ключей, поддерживает контекст диалога).
-    """
-    url = "https://pollinations.ai"
-    payload = {
-        "model": "openai",
-        "messages": messages
-    }
-    async with httpx.AsyncClient(timeout=45.0) as client:
-        response = await client.post(url, json=payload)
-        response.raise_for_status()
-        data = response.json()
-        return data["choices"][0]["message"]["content"]
+    # Список бесплатных моделей для перебора при сбое
+    fallback_models = ["openai", "mistral", "llama"]
+    last_error = ""
+
+    async with httpx.AsyncClient(timeout=40.0) as client:
+        for model_name in fallback_models:
+            try:
+                response = await client.post(
+                    "https://pollinations.ai",
+                    json={"model": model_name, "messages": messages},
+                    headers={"Content-Type": "application/json"}
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    # Правильное извлечение первого элемента списка choices
+                    if isinstance(data, dict) and "choices" in data and len(data["choices"]) > 0:
+                        return data["choices"][0]["message"]["content"]
+                last_error = f"HTTP {response.status_code}: {response.text[:150]}"
+            except Exception as e:
+                last_error = str(e)
+
+        # Запасной прямой GET-метод Pollinations, если OpenAI-шлюз перегружен
+        try:
+            last_user_msg = messages[-1]["content"] if messages else "Привет"
+            encoded = urllib.parse.quote(last_user_msg)
+            fallback_res = await client.get(f"https://pollinations.ai{encoded}")
+            if fallback_res.status_code == 200 and fallback_res.text.strip():
+                return fallback_res.text.strip()
+        except Exception as e:
+            last_error = str(e)
+
+    raise RuntimeError(f"Все текстовые шлюзы недоступны. Детали: {last_error}")
+
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest):
     try:
         formatted_messages = [{"role": m.role, "content": m.content} for m in req.messages]
         reply_text = await get_free_llm_response(formatted_messages)
-        
+
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
             "object": "chat.completion",
             "created": int(time.time()),
-            "model": req.model,
+            "model": req.model or "krot-gpt-text",
             "choices": [
                 {
                     "index": 0,
@@ -116,13 +132,16 @@ async def chat_completions(req: ChatCompletionRequest):
             ]
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ошибка генерации текста: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-# Дополнительный упрощённый маршрут (на случай если старый виджет слал на /chat)
+
 @app.post("/chat")
 async def simple_chat(req: SimpleChatRequest):
-    reply_text = await get_free_llm_response([{"role": "user", "content": req.message}])
-    return {"reply": reply_text, "response": reply_text}
+    try:
+        reply_text = await get_free_llm_response([{"role": "user", "content": req.message}])
+        return {"reply": reply_text, "response": reply_text}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # --- 2. ГЕНЕРАЦИЯ КАРТИНОК ---
@@ -130,7 +149,6 @@ async def simple_chat(req: SimpleChatRequest):
 @app.post("/v1/images/generations")
 async def generate_image(req: ImageGenerationRequest):
     try:
-        # Разбираем размер вида "1024x1024"
         width, height = 1024, 1024
         if req.size and "x" in req.size:
             parts = req.size.lower().split("x")
@@ -162,7 +180,6 @@ async def generate_image(req: ImageGenerationRequest):
 def run_video_worker(task_id: str, prompt: str):
     try:
         from gradio_client import Client
-        # Подключаемся к публичному бесплатному генератору видео на Hugging Face
         client = Client("Lightricks/LTX-Video")
         result = client.predict(
             prompt=prompt,
@@ -177,8 +194,9 @@ def run_video_worker(task_id: str, prompt: str):
     except Exception as e:
         video_tasks[task_id] = {
             "status": "failed",
-            "error": f"Сервер видео перегружен или недоступен: {str(e)}"
+            "error": f"Сервер видео перегружен: {str(e)}"
         }
+
 
 @app.post("/v1/videos/generations")
 async def create_video(req: VideoGenerationRequest, background_tasks: BackgroundTasks):
@@ -190,6 +208,7 @@ async def create_video(req: VideoGenerationRequest, background_tasks: Background
         "status": "processing",
         "check_url": f"/v1/videos/status/{task_id}"
     }
+
 
 @app.get("/v1/videos/status/{task_id}")
 async def check_video_status(task_id: str):
