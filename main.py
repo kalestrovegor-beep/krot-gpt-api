@@ -12,7 +12,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="KROT GPT Multimodal API", version="Hacker v2.9")
+app = FastAPI(title="KROT GPT Multimodal API", version="3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -66,7 +66,7 @@ def last_item(items: Any, default: Any = None) -> Any:
 async def health_check():
     return {
         "status": "online",
-        "service": "KROT GPT API v2.9",
+        "service": "KROT GPT API v3.0",
         "hf_token_configured": bool(os.getenv("HF_TOKEN")),
         "endpoints": [
             "/v1/chat/completions",
@@ -103,10 +103,7 @@ def extract_text(content: Any) -> str:
 def build_proxy_image_url(prompt: str, width: int = 768, height: int = 768, model: str = "flux") -> str:
     encoded_prompt = urllib.parse.quote(prompt)
     seed = uuid.uuid4().int % 1000000
-    return (
-        f"{SELF_BASE_URL}/v1/image-proxy"
-        f"?prompt={encoded_prompt}&width={width}&height={height}&seed={seed}&model={model}"
-    )
+    return f"{SELF_BASE_URL}/v1/image-proxy?prompt={encoded_prompt}&width={width}&height={height}&seed={seed}&model={model}"
 
 
 async def get_free_llm_response(messages: List[Dict[str, str]]) -> str:
@@ -168,7 +165,7 @@ async def image_proxy(prompt: str, width: int = 768, height: int = 768, seed: in
 
             submit_res = await client.post(
                 "https://stablehorde.net",
-                headers={"apikey": "0000000000", "Client-Agent": "KrotGPT:2.9:contact@krot.local"},
+                headers={"apikey": "0000000000", "Client-Agent": "KrotGPT:3.0:contact@krot.local"},
                 json={
                     "prompt": prompt,
                     "params": {"width": w, "height": h, "steps": 20, "n": 1},
@@ -187,7 +184,7 @@ async def image_proxy(prompt: str, width: int = 768, height: int = 768, seed: in
                 await asyncio.sleep(3)
                 check_res = await client.get(
                     f"https://stablehorde.net{job_id}",
-                    headers={"Client-Agent": "KrotGPT:2.9:contact@krot.local"}
+                    headers={"Client-Agent": "KrotGPT:3.0:contact@krot.local"}
                 )
                 if check_res.status_code == 200:
                     status_data = check_res.json()
@@ -262,7 +259,5 @@ async def chat_completions(req: ChatCompletionRequest, background_tasks: Backgro
             final_prompt = en_prompt.strip() if "перегрузка" not in en_prompt.lower() else clean_prompt
 
             img_url = build_proxy_image_url(final_prompt)
-            reply_text = (
-                f"Изображение FLUX по запросу «{clean_prompt}»:\n\n"
-                f"![Изображение]({img_url})\n\n"
-                f"[Открыть в полном размере]({img_url})"
+            reply_text = f"Изображение FLUX по запросу «{clean_prompt}»:\n\n![Изображение]({img_url})\n\n[Открыть в полном размере]({img_url})"
+
