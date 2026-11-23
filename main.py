@@ -8,7 +8,7 @@ from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="KROT GPT Multimodal API", version="2.1")
+app = FastAPI(title="KROT GPT Multimodal API", version="2.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -25,12 +25,13 @@ video_tasks: Dict[str, Dict[str, Any]] = {}
 
 class Message(BaseModel):
     role: str
-    content: str
+    content: Any  # Any, чтобы не падало, если виджет шлет массив с файлами/картинками
 
 class ChatCompletionRequest(BaseModel):
     model: Optional[str] = "openai"
     messages: List[Message]
     temperature: Optional[float] = 0.7
+    stream: Optional[bool] = False
 
 class SimpleChatRequest(BaseModel):
     message: str
@@ -52,7 +53,7 @@ class VideoGenerationRequest(BaseModel):
 async def health_check():
     return {
         "status": "online",
-        "service": "KROT GPT API v2.1",
+        "service": "KROT GPT API v2.2",
         "endpoints": [
             "/v1/chat/completions",
             "/v1/images/generations",
@@ -72,10 +73,25 @@ async def list_models():
     }
 
 
-# --- 1. ТЕКСТОВЫЙ ЧАТ (с резервированием и защитой от сбоев) ---
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+
+def extract_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts = [item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text"]
+        return " ".join(texts)
+    return str(content)
+
+def build_image_url(prompt: str, width: int = 1024, height: int = 1024, model: str = "flux") -> str:
+    encoded_prompt = urllib.parse.quote(prompt)
+    seed = uuid.uuid4().int % 1000000
+    return (
+        f"https://pollinations.ai{encoded_prompt}"
+        f"?width={width}&height={height}&seed={seed}&model={model}&nologo=true"
+    )
 
 async def get_free_llm_response(messages: List[Dict[str, str]]) -> str:
-    # Список бесплатных моделей для перебора при сбое
     fallback_models = ["openai", "mistral", "llama"]
     last_error = ""
 
@@ -89,14 +105,12 @@ async def get_free_llm_response(messages: List[Dict[str, str]]) -> str:
                 )
                 if response.status_code == 200:
                     data = response.json()
-                    # Правильное извлечение первого элемента списка choices
                     if isinstance(data, dict) and "choices" in data and len(data["choices"]) > 0:
                         return data["choices"][0]["message"]["content"]
                 last_error = f"HTTP {response.status_code}: {response.text[:150]}"
             except Exception as e:
                 last_error = str(e)
 
-        # Запасной прямой GET-метод Pollinations, если OpenAI-шлюз перегружен
         try:
             last_user_msg = messages[-1]["content"] if messages else "Привет"
             encoded = urllib.parse.quote(last_user_msg)
@@ -106,14 +120,36 @@ async def get_free_llm_response(messages: List[Dict[str, str]]) -> str:
         except Exception as e:
             last_error = str(e)
 
-    raise RuntimeError(f"Все текстовые шлюзы недоступны. Детали: {last_error}")
+    raise RuntimeError(f"Шлюзы недоступны: {last_error}")
 
+
+# --- 1. ТЕКСТОВЫЙ ЧАТ + УМНОЕ АВТО-РИСОВАНИЕ ---
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest):
     try:
-        formatted_messages = [{"role": m.role, "content": m.content} for m in req.messages]
-        reply_text = await get_free_llm_response(formatted_messages)
+        formatted_messages = [
+            {"role": m.role, "content": extract_text(m.content)}
+            for m in req.messages
+        ]
+        last_text = formatted_messages[-1]["content"].strip() if formatted_messages else ""
+        lower_text = last_text.lower()
+
+        # Проверяем, просит ли пользователь нарисовать картинку прямо в обычном чате
+        draw_triggers = ("нарисуй", "сгенерируй картинку", "сгенерируй изображение", "создай картинку", "draw ")
+        if any(lower_text.startswith(trigger) for trigger in draw_triggers):
+            # Переводим запрос на английский для лучшего качества Flux
+            en_prompt = await get_free_llm_response([
+                {
+                    "role": "system",
+                    "content": "Translate the user image request into a detailed English image generation prompt. Reply ONLY with the English prompt, no extra words."
+                },
+                {"role": "user", "content": last_text}
+            ])
+            img_url = build_image_url(en_prompt.strip())
+            reply_text = f"Вот ваше изображение по запросу «{last_text}»:\n\n![Изображение]({img_url})\n\n[Открыть картинку в полном размере]({img_url})"
+        else:
+            reply_text = await get_free_llm_response(formatted_messages)
 
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
@@ -144,7 +180,7 @@ async def simple_chat(req: SimpleChatRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# --- 2. ГЕНЕРАЦИЯ КАРТИНОК ---
+# --- 2. ПРЯМАЯ ГЕНЕРАЦИЯ КАРТИНОК ---
 
 @app.post("/v1/images/generations")
 async def generate_image(req: ImageGenerationRequest):
@@ -155,17 +191,11 @@ async def generate_image(req: ImageGenerationRequest):
             if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
                 width, height = int(parts[0]), int(parts[1])
 
-        encoded_prompt = urllib.parse.quote(req.prompt)
         images_data = []
-
         count = min(max(req.n or 1, 1), 4)
         for _ in range(count):
-            seed = uuid.uuid4().int % 1000000
-            image_url = (
-                f"https://pollinations.ai{encoded_prompt}"
-                f"?width={width}&height={height}&seed={seed}&model={req.model}&nologo=true"
-            )
-            images_data.append({"url": image_url})
+            img_url = build_image_url(req.prompt, width, height, req.model or "flux")
+            images_data.append({"url": img_url})
 
         return {
             "created": int(time.time()),
