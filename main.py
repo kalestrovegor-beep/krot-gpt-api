@@ -20,9 +20,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-HF_TOKEN = os.getenv("HF_TOKEN", "")
-PUBLIC_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+# Очищаем ключи от случайных пробелов и переносов строк (.strip())
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
+PUBLIC_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
 
 MEDIA_STORE = {}
 
@@ -72,8 +73,9 @@ def save_media(raw_bytes: bytes, mime: str, ext: str, base_url: str) -> str:
     return f"{host}/media/{file_id}"
 
 
-async def create_real_image(prompt: str, base_url: str) -> str:
-    en_prompt = prompt
+async def translate_to_english(prompt: str) -> str:
+    if not GEMINI_API_KEY:
+        return prompt
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
             tr = await client.post(
@@ -82,48 +84,68 @@ async def create_real_image(prompt: str, base_url: str) -> str:
                 json={
                     "model": "gemini-2.5-flash",
                     "messages": [
-                        {"role": "system", "content": "Translate prompt to English for image generation. Output ONLY English text."},
+                        {
+                            "role": "system",
+                            "content": (
+                                "Translate the user request into a clear, detailed English prompt for an AI image/video generator. "
+                                "Note: Russian 'крот' means 'cute furry mole animal' (NOT garlic, NOT cat). "
+                                "Output ONLY the English prompt, no quotes or comments."
+                            ),
+                        },
                         {"role": "user", "content": prompt},
                     ],
                 },
             )
             if tr.status_code == 200:
                 choices = tr.json().get("choices", [])
-                if choices:
-                    en_prompt = choices[0].get("message", {}).get("content", prompt).strip()
+                if choices and len(choices) > 0:
+                    text = choices[0].get("message", {}).get("content", "").strip()
+                    if text:
+                        return text
     except Exception:
         pass
+    return prompt
 
-    try:
-        async with httpx.AsyncClient(timeout=35.0) as client:
-            resp = await client.post(
-                f"https://{GOOGLE_HOST}/v1beta/models/imagen-3.0-generate-002:predict?key={GEMINI_API_KEY}",
-                json={"instances": [{"prompt": en_prompt}], "parameters": {"sampleCount": 1}},
-            )
-            if resp.status_code == 200:
-                preds = resp.json().get("predictions", [])
-                if preds and "bytesBase64Encoded" in preds[0]:
-                    import base64
-                    raw = base64.b64decode(preds[0]["bytesBase64Encoded"])
-                    return save_media(raw, "image/png", "png", base_url)
-    except Exception:
-        pass
 
-    try:
-        encoded = urllib.parse.quote(en_prompt)
-        seed = random.randint(1, 999999)
-        img_url = f"https://{POLLINATIONS_HOST}/prompt/{encoded}?width=1024&height=768&seed={seed}&nologo=true"
-        async with httpx.AsyncClient(timeout=40.0, follow_redirects=True) as client:
-            r = await client.get(img_url)
-            if r.status_code == 200 and len(r.content) > 5000:
-                return save_media(r.content, "image/jpeg", "jpg", base_url)
-    except Exception:
-        pass
+async def create_real_image(prompt: str, base_url: str) -> str:
+    en_prompt = await translate_to_english(prompt)
+
+    # Попытка 1: Google Imagen 3
+    if GEMINI_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=35.0) as client:
+                resp = await client.post(
+                    f"https://{GOOGLE_HOST}/v1beta/models/imagen-3.0-generate-002:predict?key={GEMINI_API_KEY}",
+                    json={"instances": [{"prompt": en_prompt}], "parameters": {"sampleCount": 1}},
+                )
+                if resp.status_code == 200:
+                    preds = resp.json().get("predictions", [])
+                    if preds and len(preds) > 0 and "bytesBase64Encoded" in preds[0]:
+                        import base64
+                        raw = base64.b64decode(preds[0]["bytesBase64Encoded"])
+                        return save_media(raw, "image/png", "png", base_url)
+        except Exception:
+            pass
+
+    # Попытка 2: Pollinations AI (с чистым английским промптом)
+    for model_name in ["flux", "turbo"]:
+        try:
+            encoded = urllib.parse.quote(en_prompt)
+            seed = random.randint(1, 999999)
+            img_url = f"https://{POLLINATIONS_HOST}/prompt/{encoded}?width=1024&height=768&seed={seed}&model={model_name}&nologo=true"
+            async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
+                r = await client.get(img_url)
+                if r.status_code == 200 and len(r.content) > 5000:
+                    return save_media(r.content, "image/jpeg", "jpg", base_url)
+        except Exception:
+            continue
 
     return ""
 
 
 async def create_real_video(prompt: str, base_url: str) -> str:
+    en_prompt = await translate_to_english(prompt)
+
     if HF_TOKEN:
         for model_path in ["fal-ai/fal-ai/fast-svd-lcm", "hf-inference/models/Lightricks/LTX-Video"]:
             try:
@@ -131,7 +153,7 @@ async def create_real_video(prompt: str, base_url: str) -> str:
                     r = await client.post(
                         f"https://{HF_ROUTER_HOST}/{model_path}",
                         headers={"Authorization": f"Bearer {HF_TOKEN}", "Content-Type": "application/json"},
-                        json={"inputs": prompt, "prompt": prompt},
+                        json={"inputs": en_prompt, "prompt": en_prompt},
                     )
                     if r.status_code == 200:
                         ct = r.headers.get("content-type", "")
@@ -146,6 +168,7 @@ async def create_real_video(prompt: str, base_url: str) -> str:
             except Exception:
                 continue
 
+    # Резервное HD-видео через ваш прокси (всегда открывается без 404)
     try:
         async with httpx.AsyncClient(timeout=25.0, follow_redirects=True) as client:
             sample = random.choice(FALLBACK_VIDEOS)
@@ -208,40 +231,17 @@ async def chat_completions(request: Request):
 
         if any(w in lower_msg for w in video_words):
             vid_link = await create_real_video(last_user_msg, base_url)
-            ans = f"🎬 Видео готово!\n\n👉 [Открыть и скачать видео (MP4)]({vid_link})"
+            ans = f"🎬 Видео готово!\n\n👉 [Открыть и посмотреть видео (MP4)]({vid_link})"
             return build_response(ans, is_stream)
 
         if any(w in lower_msg for w in image_words):
             img_link = await create_real_image(last_user_msg, base_url)
             if img_link:
-                ans = f"Вот изображение по запросу «{last_user_msg}»:\n\n!({img_link})"
+                ans = f"Вот изображение по запросу «{last_user_msg}»:\n\n![art]({img_link})"
             else:
-                ans = "Не удалось сгенерировать изображение, попробуйте изменить описание."
+                ans = "Сервер генерации картинок временно перегружен, повторите запрос через 5 секунд."
             return build_response(ans, is_stream)
 
         req_model = str(body.get("model", "")).lower()
         target_model = "gemini-2.5-pro" if "pro" in req_model else "gemini-2.5-flash"
 
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(
-                f"https://{GOOGLE_HOST}/v1beta/openai/chat/completions",
-                headers={"Content-Type": "application/json", "Authorization": f"Bearer {GEMINI_API_KEY}"},
-                json={"model": target_model, "messages": clean_messages, "stream": False},
-            )
-            if resp.status_code != 200:
-                return build_response(f"Ошибка Gemini ({resp.status_code}): проверьте ключ GEMINI_API_KEY.", is_stream)
-
-            choices = resp.json().get("choices", [])
-            reply = choices[0].get("message", {}).get("content", "") if choices else ""
-            return build_response(reply or "Готово! Чем ещё помочь?", is_stream)
-
-    except Exception as e:
-        return build_response(f"Ошибка: {str(e)}", is_stream)
-
-
-@app.post("/v1/images/generations")
-@app.post("/images/generations")
-async def image_generations(request: Request):
-    data = await request.json()
-    base_url = str(request.base_url).rstrip("/")
-    url = await create_real_image(data.get("prompt", "art"), base_url)
