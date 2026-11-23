@@ -1,13 +1,17 @@
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from openai import AsyncOpenAI
-import time
-import json
 import os
+import time
+import uuid
+import urllib.parse
+from typing import List, Optional, Dict, Any
 
-app = FastAPI(title="KROT GPT Backend API")
+import httpx
+from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
+app = FastAPI(title="KROT GPT Multimodal API", version="2.0")
+
+# Разрешаем запросы с любых доменов (обязательно для работы с Tilda)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -16,96 +20,180 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+# Хранилище статусов видео-задач
+video_tasks: Dict[str, Dict[str, Any]] = {}
 
-ai_client = AsyncOpenAI(
-    base_url="https://openrouter.ai" + "/api/v1",
-    api_key=OPENROUTER_API_KEY,
-)
 
-FREE_MODEL = "openrouter/free"
+# --- МОДЕЛИ ДАННЫХ ---
+
+class Message(BaseModel):
+    role: str
+    content: str
+
+class ChatCompletionRequest(BaseModel):
+    model: Optional[str] = "gpt-4o-mini"
+    messages: List[Message]
+    temperature: Optional[float] = 0.7
+
+class SimpleChatRequest(BaseModel):
+    message: str
+
+class ImageGenerationRequest(BaseModel):
+    prompt: str
+    n: Optional[int] = 1
+    size: Optional[str] = "1024x1024"
+    model: Optional[str] = "flux"
+
+class VideoGenerationRequest(BaseModel):
+    prompt: str
+
+
+# --- СЛУЖЕБНЫЕ МАРШРУТЫ ---
 
 @app.get("/")
-async def root():
-    return {"status": "ok", "service": "KROT GPT API is running 24/7"}
-
-@app.post("/v1/chat/completions")
-@app.post("/chat/completions")
-async def chat_completions(request: Request):
-    body = await request.json()
-    messages = body.get("messages", [])
-    model_name = body.get("model", "gpt-6-astra")
-    is_stream = body.get("stream", False)
-
-    if is_stream:
-        async def event_generator():
-            try:
-                stream = await ai_client.chat.completions.create(
-                    model=FREE_MODEL,
-                    messages=messages,
-                    stream=True
-                )
-                async for chunk in stream:
-                    if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-                        text_piece = chunk.choices[0].delta.content
-                        data = {
-                            "id": "chatcmpl-krot-live",
-                            "object": "chat.completion.chunk",
-                            "created": int(time.time()),
-                            "model": model_name,
-                            "choices": [{"index": 0, "delta": {"content": text_piece}, "finish_reason": None}]
-                        }
-                        yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
-            except Exception as e:
-                error_data = {
-                    "id": "chatcmpl-krot-err",
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": model_name,
-                    "choices": [{"index": 0, "delta": {"content": f"Ошибка сервера: {str(e)}"}, "finish_reason": None}]
-                }
-                yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n"
-
-            yield "data: [DONE]\n\n"
-
-        return StreamingResponse(event_generator(), media_type="text/event-stream")
-
-    response = await ai_client.chat.completions.create(
-        model=FREE_MODEL,
-        messages=messages,
-        stream=False
-    )
+@app.get("/v1")
+async def health_check():
     return {
-        "id": "chatcmpl-krot-live",
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": model_name,
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": response.choices[0].message.content},
-            "finish_reason": "stop"
-        }]
+        "status": "online",
+        "service": "KROT GPT API",
+        "endpoints": [
+            "/v1/chat/completions",
+            "/v1/images/generations",
+            "/v1/videos/generations"
+        ]
     }
 
 @app.get("/v1/models")
-@app.get("/models")
 async def list_models():
     return {
         "object": "list",
-        "data": [{"id": "gpt-6-astra", "object": "model", "owned_by": "krot"}]
+        "data": [
+            {"id": "krot-gpt-text", "object": "model", "owned_by": "krot"},
+            {"id": "krot-flux-image", "object": "model", "owned_by": "krot"},
+            {"id": "krot-ltx-video", "object": "model", "owned_by": "krot"},
+        ]
     }
 
-books_db = [{"id": 1, "title": "Приключения Крота в космосе", "author": "KROT Team"}]
 
-@app.get("/v1/books")
-@app.get("/books")
-async def get_books():
-    return books_db
+# --- 1. ТЕКСТОВЫЙ ЧАТ (OpenAI-совместимый) ---
 
-@app.post("/v1/books")
-@app.post("/books")
-async def add_book(request: Request):
-    data = await request.json()
-    new_book = {"id": len(books_db) + 1, "title": data.get("title", ""), "author": data.get("author", "")}
-    books_db.append(new_book)
-    return new_book
+async def get_free_llm_response(messages: List[Dict[str, str]]) -> str:
+    """
+    Отправляет запрос в бесплатный текстовый шлюз Pollinations Text API
+    (не требует платных ключей, поддерживает контекст диалога).
+    """
+    url = "https://pollinations.ai"
+    payload = {
+        "model": "openai",
+        "messages": messages
+    }
+    async with httpx.AsyncClient(timeout=45.0) as client:
+        response = await client.post(url, json=payload)
+        response.raise_for_status()
+        data = response.json()
+        return data["choices"][0]["message"]["content"]
+
+@app.post("/v1/chat/completions")
+async def chat_completions(req: ChatCompletionRequest):
+    try:
+        formatted_messages = [{"role": m.role, "content": m.content} for m in req.messages]
+        reply_text = await get_free_llm_response(formatted_messages)
+        
+        return {
+            "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": req.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": reply_text
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка генерации текста: {str(e)}")
+
+# Дополнительный упрощённый маршрут (на случай если старый виджет слал на /chat)
+@app.post("/chat")
+async def simple_chat(req: SimpleChatRequest):
+    reply_text = await get_free_llm_response([{"role": "user", "content": req.message}])
+    return {"reply": reply_text, "response": reply_text}
+
+
+# --- 2. ГЕНЕРАЦИЯ КАРТИНОК ---
+
+@app.post("/v1/images/generations")
+async def generate_image(req: ImageGenerationRequest):
+    try:
+        # Разбираем размер вида "1024x1024"
+        width, height = 1024, 1024
+        if req.size and "x" in req.size:
+            parts = req.size.lower().split("x")
+            if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                width, height = int(parts[0]), int(parts[1])
+
+        encoded_prompt = urllib.parse.quote(req.prompt)
+        images_data = []
+
+        count = min(max(req.n or 1, 1), 4)
+        for _ in range(count):
+            seed = uuid.uuid4().int % 1000000
+            image_url = (
+                f"https://pollinations.ai{encoded_prompt}"
+                f"?width={width}&height={height}&seed={seed}&model={req.model}&nologo=true"
+            )
+            images_data.append({"url": image_url})
+
+        return {
+            "created": int(time.time()),
+            "data": images_data
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка генерации изображения: {str(e)}")
+
+
+# --- 3. ГЕНЕРАЦИЯ ВИДЕО (Асинхронная) ---
+
+def run_video_worker(task_id: str, prompt: str):
+    try:
+        from gradio_client import Client
+        # Подключаемся к публичному бесплатному генератору видео на Hugging Face
+        client = Client("Lightricks/LTX-Video")
+        result = client.predict(
+            prompt=prompt,
+            negative_prompt="low quality, worst quality, deformed, distorted, blurry",
+            api_name="/generate"
+        )
+        video_url = result[0] if isinstance(result, (list, tuple)) else str(result)
+        video_tasks[task_id] = {
+            "status": "completed",
+            "video_url": video_url
+        }
+    except Exception as e:
+        video_tasks[task_id] = {
+            "status": "failed",
+            "error": f"Сервер видео перегружен или недоступен: {str(e)}"
+        }
+
+@app.post("/v1/videos/generations")
+async def create_video(req: VideoGenerationRequest, background_tasks: BackgroundTasks):
+    task_id = str(uuid.uuid4())
+    video_tasks[task_id] = {"status": "processing"}
+    background_tasks.add_task(run_video_worker, task_id, req.prompt)
+    return {
+        "task_id": task_id,
+        "status": "processing",
+        "check_url": f"/v1/videos/status/{task_id}"
+    }
+
+@app.get("/v1/videos/status/{task_id}")
+async def check_video_status(task_id: str):
+    task = video_tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    return task
