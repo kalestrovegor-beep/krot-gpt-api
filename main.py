@@ -12,7 +12,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="KROT GPT API", version="3.2")
+app = FastAPI(title="KROT GPT API", version="Hacker v3.3")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 video_tasks: Dict[str, Dict[str, Any]] = {}
@@ -47,7 +47,7 @@ def last_item(items: Any, default: Any = None) -> Any:
 async def health_check(request: Request):
     return {
         "status": "online",
-        "service": "KROT GPT API v3.2",
+        "service": "KROT GPT API v3.3",
         "base_url": str(request.base_url).rstrip("/"),
         "hf_token": bool(os.getenv("HF_TOKEN"))
     }
@@ -87,9 +87,30 @@ async def ask_llm(messages: List[Dict[str, str]]) -> str:
             pass
     return "Сервер перегружен, повторите запрос."
 
+def generate_via_hf_space(prompt: str, seed: int, w: int, h: int) -> bytes:
+    from gradio_client import Client
+    hf = os.getenv("HF_TOKEN", "").strip()
+    client = Client("black-forest-labs/FLUX.1-schnell", token=hf if hf else None)
+    res = client.predict(
+        prompt=prompt,
+        seed=seed,
+        randomize_seed=False,
+        width=w,
+        height=h,
+        num_inference_steps=4,
+        api_name="/infer"
+    )
+    img_path = first_item(res, res) if isinstance(res, (list, tuple)) else res
+    if isinstance(img_path, dict):
+        img_path = img_path.get("path") or img_path.get("url")
+    with open(str(img_path), "rb") as f:
+        return f.read()
+
 @app.get("/v1/image-proxy")
 async def image_proxy(prompt: str, width: int = 768, height: int = 768, seed: int = 42):
     hf = os.getenv("HF_TOKEN", "").strip()
+    hf_err = "нет токена"
+
     async with httpx.AsyncClient(timeout=90.0, follow_redirects=True) as client:
         if hf:
             try:
@@ -100,28 +121,15 @@ async def image_proxy(prompt: str, width: int = 768, height: int = 768, seed: in
                 )
                 if r.status_code == 200 and r.headers.get("content-type", "").startswith("image/"):
                     return Response(content=r.content, media_type=r.headers["content-type"])
-            except Exception:
-                pass
-        w, h = max(512, min(768, (width // 64) * 64)), max(512, min(768, (height // 64) * 64))
-        sub = await client.post(
-            "https://stablehorde.net",
-            headers={"apikey": "0000000000", "Client-Agent": "KrotGPT:3.2:krot@local"},
-            json={"prompt": prompt, "params": {"width": w, "height": h, "steps": 20, "n": 1}, "nsfw": False, "r2": True}
-        )
-        if sub.status_code != 202:
-            raise HTTPException(status_code=502, detail="Ошибка очереди генерации")
-        jid = sub.json().get("id")
-        for _ in range(20):
-            await asyncio.sleep(3)
-            chk = await client.get(f"https://stablehorde.net{jid}", headers={"Client-Agent": "KrotGPT:3.2:krot@local"})
-            if chk.status_code == 200 and chk.json().get("done"):
-                url = first_item(chk.json().get("generations"), {}).get("img")
-                if url:
-                    img = await client.get(url)
-                    if img.status_code == 200:
-                        return Response(content=img.content, media_type=img.headers.get("content-type", "image/webp"))
-                break
-        raise HTTPException(status_code=504, detail="Таймаут генерации")
+                hf_err = f"HF {r.status_code}: {r.text[:120]}"
+            except Exception as e:
+                hf_err = str(e)
+
+    try:
+        img_bytes = await asyncio.to_thread(generate_via_hf_space, prompt, seed, width, height)
+        return Response(content=img_bytes, media_type="image/webp")
+    except Exception as space_err:
+        raise HTTPException(status_code=502, detail=f"Ошибка генерации. HF Router: {hf_err} | HF Space: {str(space_err)[:150]}")
 
 def run_video(task_id: str, prompt: str):
     try:
