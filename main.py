@@ -12,7 +12,7 @@ from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="KROT GPT API", version="3.9")
+app = FastAPI(title="KROT GPT API", version="4.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 video_tasks: Dict[str, Dict[str, Any]] = {}
@@ -49,13 +49,14 @@ def last_item(items: Any, default: Any = None) -> Any:
 async def health_check(request: Request):
     return {
         "status": "online",
-        "service": "KROT GPT API v3.9",
+        "service": "KROT GPT API v4.0",
         "base_url": str(request.base_url).rstrip("/"),
         "hf_token": bool(os.getenv("HF_TOKEN")),
         "openrouter_key": bool(os.getenv("OPENROUTER_API_KEY"))
     }
 
 @app.get("/v1/models")
+@app.get("/models")
 async def list_models():
     return {"object": "list", "data": [{"id": "krot-gpt-text", "object": "model"}, {"id": "krot-flux-image", "object": "model"}, {"id": "krot-wan-video", "object": "model"}]}
 
@@ -157,14 +158,14 @@ async def image_proxy(prompt: str, width: int = 768, height: int = 768, seed: in
                 h = max(512, min(768, (height // 64) * 64))
                 sub = await client.post(
                     "https://stablehorde.net",
-                    headers={"apikey": "0000000000", "Client-Agent": "KrotGPT:3.9:contact@krot.ai"},
+                    headers={"apikey": "0000000000", "Client-Agent": "KrotGPT:4.0:contact@krot.ai"},
                     json={"prompt": prompt, "models": ["Flux.1-Schnell fp8"], "params": {"width": w, "height": h, "steps": 4, "n": 1}, "nsfw": False, "r2": True}
                 )
                 if sub.status_code == 202:
                     jid = sub.json().get("id")
                     for _ in range(25):
                         await asyncio.sleep(3)
-                        chk = await client.get(f"https://stablehorde.net{jid}", headers={"Client-Agent": "KrotGPT:3.9:contact@krot.ai"})
+                        chk = await client.get(f"https://stablehorde.net{jid}", headers={"Client-Agent": "KrotGPT:4.0:contact@krot.ai"})
                         if chk.status_code == 200 and chk.json().get("done"):
                             url = first_item(chk.json().get("generations"), {}).get("img")
                             if url:
@@ -215,3 +216,4 @@ async def get_video_file(task_id: str):
     task = video_tasks.get(task_id)
     if not task or not task.get("file_path") or not os.path.exists(task["file_path"]):
         raise HTTPException(status_code=404, detail="Видеофайл не найден")
+    return FileResponse(task["file_path"], media_type="video/mp4")
