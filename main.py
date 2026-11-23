@@ -12,7 +12,7 @@ from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="KROT GPT API", version="Hacker v3.6")
+app = FastAPI(title="KROT GPT API", version="Hacker v3.7")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 video_tasks: Dict[str, Dict[str, Any]] = {}
@@ -47,7 +47,7 @@ def last_item(items: Any, default: Any = None) -> Any:
 async def health_check(request: Request):
     return {
         "status": "online",
-        "service": "KROT GPT API v3.6",
+        "service": "KROT GPT API v3.7",
         "base_url": str(request.base_url).rstrip("/"),
         "hf_token": bool(os.getenv("HF_TOKEN"))
     }
@@ -134,14 +134,14 @@ async def image_proxy(prompt: str, width: int = 768, height: int = 768, seed: in
             h = max(512, min(768, (height // 64) * 64))
             sub = await client.post(
                 "https://stablehorde.net",
-                headers={"apikey": "0000000000", "Client-Agent": "KrotGPT:3.6:contact@krot.ai"},
+                headers={"apikey": "0000000000", "Client-Agent": "KrotGPT:3.7:contact@krot.ai"},
                 json={"prompt": prompt, "models": ["Flux.1-Schnell fp8"], "params": {"width": w, "height": h, "steps": 4, "n": 1}, "nsfw": False, "r2": True}
             )
             if sub.status_code == 202:
                 jid = sub.json().get("id")
                 for _ in range(25):
                     await asyncio.sleep(3)
-                    chk = await client.get(f"https://stablehorde.net{jid}", headers={"Client-Agent": "KrotGPT:3.6:contact@krot.ai"})
+                    chk = await client.get(f"https://stablehorde.net{jid}", headers={"Client-Agent": "KrotGPT:3.7:contact@krot.ai"})
                     if chk.status_code == 200 and chk.json().get("done"):
                         url = first_item(chk.json().get("generations"), {}).get("img")
                         if url:
@@ -225,3 +225,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request, bg: Bac
         tid = str(uuid.uuid4())
         video_tasks[tid] = {"status": "processing"}
         bg.add_task(run_video, tid, en if "перегружен" not in en else clean, base_url)
+        reply = f"Видео запущено по запросу «{clean}». Проверьте готовность через 1–2 мин:\n[Статус видео]({base_url}/v1/videos/status/{tid})"
+    else:
+        reply = await ask_llm(msgs)
+
