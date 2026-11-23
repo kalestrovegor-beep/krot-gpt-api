@@ -1,6 +1,7 @@
 import os
 import json
 import uuid
+import base64
 import random
 import urllib.parse
 import asyncio
@@ -20,7 +21,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Очищаем ключи от случайных пробелов и переносов строк (.strip())
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 PUBLIC_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
@@ -87,9 +87,9 @@ async def translate_to_english(prompt: str) -> str:
                         {
                             "role": "system",
                             "content": (
-                                "Translate the user request into a clear, detailed English prompt for an AI image/video generator. "
-                                "Note: Russian 'крот' means 'cute furry mole animal' (NOT garlic, NOT cat). "
-                                "Output ONLY the English prompt, no quotes or comments."
+                                "Translate user request into a detailed English AI art prompt. "
+                                "Russian 'крот' means 'cute furry mole animal' (NOT garlic, NOT cat). "
+                                "Output ONLY the English prompt."
                             ),
                         },
                         {"role": "user", "content": prompt},
@@ -98,7 +98,7 @@ async def translate_to_english(prompt: str) -> str:
             )
             if tr.status_code == 200:
                 choices = tr.json().get("choices", [])
-                if choices and len(choices) > 0:
+                if choices:
                     text = choices[0].get("message", {}).get("content", "").strip()
                     if text:
                         return text
@@ -110,7 +110,6 @@ async def translate_to_english(prompt: str) -> str:
 async def create_real_image(prompt: str, base_url: str) -> str:
     en_prompt = await translate_to_english(prompt)
 
-    # Попытка 1: Google Imagen 3
     if GEMINI_API_KEY:
         try:
             async with httpx.AsyncClient(timeout=35.0) as client:
@@ -120,14 +119,12 @@ async def create_real_image(prompt: str, base_url: str) -> str:
                 )
                 if resp.status_code == 200:
                     preds = resp.json().get("predictions", [])
-                    if preds and len(preds) > 0 and "bytesBase64Encoded" in preds[0]:
-                        import base64
+                    if preds and "bytesBase64Encoded" in preds[0]:
                         raw = base64.b64decode(preds[0]["bytesBase64Encoded"])
                         return save_media(raw, "image/png", "png", base_url)
         except Exception:
             pass
 
-    # Попытка 2: Pollinations AI (с чистым английским промптом)
     for model_name in ["flux", "turbo"]:
         try:
             encoded = urllib.parse.quote(en_prompt)
@@ -168,7 +165,6 @@ async def create_real_video(prompt: str, base_url: str) -> str:
             except Exception:
                 continue
 
-    # Резервное HD-видео через ваш прокси (всегда открывается без 404)
     try:
         async with httpx.AsyncClient(timeout=25.0, follow_redirects=True) as client:
             sample = random.choice(FALLBACK_VIDEOS)
@@ -245,3 +241,9 @@ async def chat_completions(request: Request):
         req_model = str(body.get("model", "")).lower()
         target_model = "gemini-2.5-pro" if "pro" in req_model else "gemini-2.5-flash"
 
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                f"https://{GOOGLE_HOST}/v1beta/openai/chat/completions",
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {GEMINI_API_KEY}"},
+                json={"model": target_model, "messages": clean_messages, "stream": False},
+            )
