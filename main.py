@@ -1,15 +1,15 @@
 import os
+import json
 import base64
 import asyncio
 import httpx
 import websockets
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 app = FastAPI()
 
-# Настройка CORS для работы с сайтом без блокировок браузера
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -52,12 +52,43 @@ async def generate_flux_image(prompt: str) -> str:
         return base64.b64encode(resp.content).decode("utf-8")
 
 
-# 1. ЕДИНЫЙ ЧАТ (Текст + Авто-генерация картинок)
+# Вспомогательная функция: отдает готовый текст в том формате (stream или JSON), который ждет сайт
+def format_openai_response(text: str, is_stream: bool):
+    if is_stream:
+        async def sse_gen():
+            chunk = {
+                "id": "chatcmpl-krot",
+                "object": "chat.completion.chunk",
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": None}],
+            }
+            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+            end_chunk = {
+                "id": "chatcmpl-krot",
+                "object": "chat.completion.chunk",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }
+            yield f"data: {json.dumps(end_chunk, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(sse_gen(), media_type="text/event-stream")
+
+    return JSONResponse(
+        content={
+            "id": "chatcmpl-krot",
+            "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+        }
+    )
+
+
+# 1. ЕДИНЫЙ ЧАТ (Текст + Авто-генерация картинок с поддержкой stream)
 @app.post("/v1/chat/completions")
 @app.post("/chat/completions")
 async def chat_completions(request: Request):
+    body = await request.json()
+    is_stream = bool(body.get("stream", False))
+
     try:
-        body = await request.json()
         messages = body.get("messages", [])
         last_user_msg = ""
         for m in reversed(messages):
@@ -69,6 +100,7 @@ async def chat_completions(request: Request):
         lower_msg = last_user_msg.lower()
         image_triggers = ["нарисуй", "сгенерируй картинку", "сгенерируй фото", "создай изображение", "draw "]
 
+        # Если запрос на генерацию картинки
         if any(trigger in lower_msg for trigger in image_triggers):
             en_prompt = last_user_msg
             try:
@@ -85,64 +117,65 @@ async def chat_completions(request: Request):
                         },
                     )
                     if tr_resp.status_code == 200:
-                        en_prompt = tr_resp.json()["choices"][0]["message"]["content"].strip()
+                        en_prompt = tr_resp.json()["choices"]["message"]["content"].strip()
             except Exception:
                 pass
 
             b64_img = await generate_flux_image(en_prompt)
             md_answer = f"Вот ваше изображение по запросу «{last_user_msg}»:\n\n![generated](data:image/png;base64,{b64_img})"
+            return format_openai_response(md_answer, is_stream)
 
-            return JSONResponse(
-                content={
-                    "id": "chatcmpl-img",
-                    "object": "chat.completion",
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {"role": "assistant", "content": md_answer},
-                            "finish_reason": "stop",
-                        }
-                    ],
-                }
-            )
-
-        # Обычный текстовый запрос -> Gemini
+        # Обычный текстовый запрос -> Gemini (сохраняем исходный режим stream)
         requested_model = str(body.get("model", "")).lower()
         body["model"] = "gemini-2.5-pro" if "pro" in requested_model else "gemini-2.5-flash"
-        body["stream"] = False
 
-        for unsupported in ["frequency_penalty", "presence_penalty", "logit_bias", "user", "reasoning_effort", "stream_options"]:
-            body.pop(unsupported, None)
+        # Оставляем только те поля, которые гарантированно понимает Gemini OpenAI-слой
+        clean_body = {
+            "model": body["model"],
+            "messages": messages,
+            "stream": is_stream,
+        }
+        if "temperature" in body:
+            clean_body["temperature"] = body["temperature"]
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {GEMINI_API_KEY}",
+        }
+        url = "https://googleapis.com"
+
+        if is_stream:
+            async def gemini_stream():
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    async with client.stream("POST", url, headers=headers, json=clean_body) as resp:
+                        if resp.status_code != 200:
+                            err_text = await resp.aread()
+                            err_chunk = {
+                                "id": "chatcmpl-err",
+                                "object": "chat.completion.chunk",
+                                "choices": [{"index": 0, "delta": {"content": f"Ошибка Gemini ({resp.status_code}): {err_text.decode('utf-8', 'ignore')}"}, "finish_reason": "stop"}],
+                            }
+                            yield f"data: {json.dumps(err_chunk, ensure_ascii=False)}\n\n"
+                            yield "data: [DONE]\n\n"
+                            return
+
+                        async for line in resp.aiter_lines():
+                            if line:
+                                yield f"{line}\n\n"
+
+            return StreamingResponse(gemini_stream(), media_type="text/event-stream")
 
         async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(
-                "https://googleapis.com",
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {GEMINI_API_KEY}",
-                },
-                json=body,
-            )
-            return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
+            resp = await client.post(url, headers=headers, json=clean_body)
+            if resp.status_code != 200:
+                return format_openai_response(f"Ошибка Gemini ({resp.status_code}): {resp.text}", False)
+            return Response(content=resp.content, status_code=200, media_type="application/json")
 
     except Exception as e:
-        return JSONResponse(
-            status_code=200,
-            content={
-                "id": "chatcmpl-err",
-                "object": "chat.completion",
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": f"Ошибка сервера: {str(e)}"},
-                        "finish_reason": "stop",
-                    }
-                ],
-            },
-        )
+        return format_openai_response(f"Ошибка сервера: {str(e)}", is_stream)
 
 
-# 2. ГЕНЕРАЦИЯ КАРТИНОК
+# 2. ОТДЕЛЬНЫЙ ЭНДПОИНТ ДЛЯ КАРТИНОК
 @app.post("/v1/images/generations")
 @app.post("/images/generations")
 async def image_generations(request: Request):
@@ -155,7 +188,7 @@ async def image_generations(request: Request):
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
-# 3. ГЕНЕРАЦИЯ ВИДЕО
+# 3. ОТДЕЛЬНЫЙ ЭНДПОИНТ ДЛЯ ВИДЕО
 @app.post("/v1/video/generations")
 @app.post("/video/generations")
 async def video_generations(request: Request):
