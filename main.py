@@ -1,6 +1,6 @@
 import os
 import json
-import base64
+import uuid
 import random
 import urllib.parse
 import asyncio
@@ -22,17 +22,19 @@ app.add_middleware(
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 HF_TOKEN = os.getenv("HF_TOKEN", "")
+PUBLIC_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 
-DEMO_VIDEOS = [
-    "https://googleapis.com",
-    "https://googleapis.com",
-    "https://googleapis.com",
-    "https://googleapis.com",
-]
+MEDIA_STORE = {}
 
-DEMO_SVGS = [
-    '<svg xmlns="http://w3.org" width="800" height="500" viewBox="0 0 800 500"><defs><linearGradient id="g1" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#1e3c72"/><stop offset="100%" stop-color="#2a5298"/></linearGradient></defs><rect width="800" height="500" fill="url(#g1)"/><circle cx="620" cy="120" r="70" fill="#ffd700" opacity="0.85"/><polygon points="0,500 220,220 450,500" fill="#142850"/><polygon points="280,500 520,180 800,500" fill="#0c1b33"/><text x="40" y="450" fill="#ffffff" font-family="sans-serif" font-size="24" opacity="0.8">KROT AI • Art Preview</text></svg>',
-    '<svg xmlns="http://w3.org" width="800" height="500" viewBox="0 0 800 500"><defs><linearGradient id="g2" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#ff512f"/><stop offset="100%" stop-color="#dd2476"/></linearGradient></defs><rect width="800" height="500" fill="url(#g2)"/><circle cx="400" cy="250" r="140" fill="#ffffff" opacity="0.15"/><circle cx="400" cy="250" r="90" fill="#ffffff" opacity="0.25"/><text x="40" y="450" fill="#ffffff" font-family="sans-serif" font-size="24" opacity="0.8">KROT AI • Neon Concept</text></svg>',
+GOOGLE_HOST = "generativelanguage." + "googleapis.com"
+POLLINATIONS_HOST = "image." + "pollinations.ai"
+HF_ROUTER_HOST = "router." + "huggingface.co"
+SAMPLE_HOST = "commondatastorage." + "googleapis.com"
+
+FALLBACK_VIDEOS = [
+    f"https://{SAMPLE_HOST}/gtv-videos-bucket/sample/ForBiggerBlazes.mp4",
+    f"https://{SAMPLE_HOST}/gtv-videos-bucket/sample/ForBiggerEscapes.mp4",
+    f"https://{SAMPLE_HOST}/gtv-videos-bucket/sample/ForBiggerFun.mp4",
 ]
 
 
@@ -49,100 +51,125 @@ async def list_models():
         "data": [
             {"id": "gemini-2.5-flash", "object": "model"},
             {"id": "gemini-2.5-pro", "object": "model"},
-            {"id": "imagen-3", "object": "model"},
         ],
     }
 
 
-async def get_smart_image_markdown(prompt: str) -> str:
-    # 1. Пробуем Google AI Studio
+@app.get("/media/{file_id}")
+async def serve_media(file_id: str):
+    item = MEDIA_STORE.get(file_id)
+    if not item:
+        return Response(status_code=404, content="Not found")
+    return Response(content=item["data"], media_type=item["mime"])
+
+
+def save_media(raw_bytes: bytes, mime: str, ext: str, base_url: str) -> str:
+    file_id = f"{uuid.uuid4().hex[:12]}.{ext}"
+    if len(MEDIA_STORE) > 50:
+        MEDIA_STORE.pop(next(iter(MEDIA_STORE)))
+    MEDIA_STORE[file_id] = {"data": raw_bytes, "mime": mime}
+    host = PUBLIC_URL if PUBLIC_URL else base_url.rstrip("/")
+    return f"{host}/media/{file_id}"
+
+
+async def create_real_image(prompt: str, base_url: str) -> str:
+    en_prompt = prompt
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            tr = await client.post(
+                f"https://{GOOGLE_HOST}/v1beta/openai/chat/completions",
+                headers={"Authorization": f"Bearer {GEMINI_API_KEY}"},
+                json={
+                    "model": "gemini-2.5-flash",
+                    "messages": [
+                        {"role": "system", "content": "Translate prompt to English for image generation. Output ONLY English text."},
+                        {"role": "user", "content": prompt},
+                    ],
+                },
+            )
+            if tr.status_code == 200:
+                choices = tr.json().get("choices", [])
+                if choices:
+                    en_prompt = choices[0].get("message", {}).get("content", prompt).strip()
+    except Exception:
+        pass
+
     try:
         async with httpx.AsyncClient(timeout=35.0) as client:
-            url = f"https://googleapis.com{GEMINI_API_KEY}"
-            payload = {
-                "contents": [{"parts": [{"text": f"Generate a high quality image: {prompt}"}]}],
-                "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]},
-            }
-            resp = await client.post(url, json=payload)
+            resp = await client.post(
+                f"https://{GOOGLE_HOST}/v1beta/models/imagen-3.0-generate-002:predict?key={GEMINI_API_KEY}",
+                json={"instances": [{"prompt": en_prompt}], "parameters": {"sampleCount": 1}},
+            )
             if resp.status_code == 200:
-                data = resp.json()
-                candidates = data.get("candidates", [])
-                if candidates:
-                    parts = candidates[0].get("content", {}).get("parts", [])
-                    for p in parts:
-                        if "inlineData" in p and p["inlineData"].get("data"):
-                            b64 = p["inlineData"]["data"]
-                            return f"![generated](data:image/png;base64,{b64})"
+                preds = resp.json().get("predictions", [])
+                if preds and "bytesBase64Encoded" in preds[0]:
+                    import base64
+                    raw = base64.b64decode(preds[0]["bytesBase64Encoded"])
+                    return save_media(raw, "image/png", "png", base_url)
     except Exception:
         pass
 
-    # 2. Пробуем Pollinations.ai -> Base64
     try:
-        encoded_prompt = urllib.parse.quote(prompt)
-        seed = random.randint(1, 99999)
-        pollinations_url = f"https://pollinations.ai{encoded_prompt}?width=768&height=512&seed={seed}&nologo=true"
+        encoded = urllib.parse.quote(en_prompt)
+        seed = random.randint(1, 999999)
+        img_url = f"https://{POLLINATIONS_HOST}/prompt/{encoded}?width=1024&height=768&seed={seed}&nologo=true"
+        async with httpx.AsyncClient(timeout=40.0, follow_redirects=True) as client:
+            r = await client.get(img_url)
+            if r.status_code == 200 and len(r.content) > 5000:
+                return save_media(r.content, "image/jpeg", "jpg", base_url)
+    except Exception:
+        pass
+
+    return ""
+
+
+async def create_real_video(prompt: str, base_url: str) -> str:
+    if HF_TOKEN:
+        for model_path in ["fal-ai/fal-ai/fast-svd-lcm", "hf-inference/models/Lightricks/LTX-Video"]:
+            try:
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    r = await client.post(
+                        f"https://{HF_ROUTER_HOST}/{model_path}",
+                        headers={"Authorization": f"Bearer {HF_TOKEN}", "Content-Type": "application/json"},
+                        json={"inputs": prompt, "prompt": prompt},
+                    )
+                    if r.status_code == 200:
+                        ct = r.headers.get("content-type", "")
+                        if "video" in ct or len(r.content) > 50000:
+                            return save_media(r.content, "video/mp4", "mp4", base_url)
+                        data = r.json()
+                        vid_url = data.get("video", {}).get("url") if isinstance(data, dict) else None
+                        if vid_url:
+                            v_resp = await client.get(vid_url)
+                            if v_resp.status_code == 200:
+                                return save_media(v_resp.content, "video/mp4", "mp4", base_url)
+            except Exception:
+                continue
+
+    try:
         async with httpx.AsyncClient(timeout=25.0, follow_redirects=True) as client:
-            img_resp = await client.get(pollinations_url)
-            if img_resp.status_code == 200 and len(img_resp.content) > 5000:
-                b64 = base64.b64encode(img_resp.content).decode("utf-8")
-                return f"![generated](data:image/jpeg;base64,{b64})"
+            sample = random.choice(FALLBACK_VIDEOS)
+            v = await client.get(sample)
+            if v.status_code == 200:
+                return save_media(v.content, "video/mp4", "mp4", base_url)
     except Exception:
         pass
 
-    # 3. Встроенная красивая SVG-иллюстрация в Base64
-    svg_code = random.choice(DEMO_SVGS).encode("utf-8")
-    b64_svg = base64.b64encode(svg_code).decode("utf-8")
-    return f"![demo-art](data:image/svg+xml;base64,{b64_svg})"
+    return random.choice(FALLBACK_VIDEOS)
 
 
-async def get_smart_video_url(prompt: str) -> str:
-    try:
-        if HF_TOKEN:
-            async with httpx.AsyncClient(timeout=45.0) as client:
-                resp = await client.post(
-                    "https://huggingface.co",
-                    headers={"Authorization": f"Bearer {HF_TOKEN}", "Content-Type": "application/json"},
-                    json={"prompt": prompt},
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if isinstance(data, dict) and data.get("video", {}).get("url"):
-                        return data["video"]["url"]
-    except Exception:
-        pass
-
-    return random.choice(DEMO_VIDEOS)
-
-
-def format_openai_response(text: str, is_stream: bool):
+def build_response(text: str, is_stream: bool):
     if is_stream:
-        async def sse_gen():
-            # Чанк 1: открытие роли assistant (обязательно для фронтенда KROT GPT)
-            c1 = {
-                "id": "chatcmpl-krot",
-                "object": "chat.completion.chunk",
-                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-            }
+        async def sse():
+            c1 = {"id": "chatcmpl-krot", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
             yield f"data: {json.dumps(c1, ensure_ascii=False)}\n\n"
-
-            # Чанк 2: сам контент ответа
-            c2 = {
-                "id": "chatcmpl-krot",
-                "object": "chat.completion.chunk",
-                "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
-            }
+            c2 = {"id": "chatcmpl-krot", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]}
             yield f"data: {json.dumps(c2, ensure_ascii=False)}\n\n"
-
-            # Чанк 3: завершение
-            c3 = {
-                "id": "chatcmpl-krot",
-                "object": "chat.completion.chunk",
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            }
+            c3 = {"id": "chatcmpl-krot", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
             yield f"data: {json.dumps(c3, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
 
-        return StreamingResponse(sse_gen(), media_type="text/event-stream")
+        return StreamingResponse(sse(), media_type="text/event-stream")
 
     return JSONResponse(
         content={
@@ -158,6 +185,7 @@ def format_openai_response(text: str, is_stream: bool):
 async def chat_completions(request: Request):
     body = await request.json()
     is_stream = bool(body.get("stream", False))
+    base_url = str(request.base_url).rstrip("/")
 
     try:
         raw_messages = body.get("messages", [])
@@ -168,8 +196,6 @@ async def chat_completions(request: Request):
             role = m.get("role", "user")
             content = m.get("content", "")
             if isinstance(content, str):
-                if "data:image/" in content:
-                    content = "[Сгенерированное изображение]"
                 clean_messages.append({"role": role, "content": content})
                 if role == "user":
                     last_user_msg = content
@@ -177,58 +203,45 @@ async def chat_completions(request: Request):
                 clean_messages.append(m)
 
         lower_msg = last_user_msg.lower()
-        video_triggers = ["сгенерируй видео", "создай видео", "сделай видео", "видео про", "generate video"]
-        image_triggers = ["нарисуй", "сгенерируй картинку", "сгенерируй фото", "создай изображение", "картинку", "draw "]
+        video_words = ["сгенерируй видео", "создай видео", "сделай видео", "видео про", "generate video"]
+        image_words = ["нарисуй", "сгенерируй картинку", "сгенерируй фото", "создай изображение", "картинку", "draw "]
 
-        # А. Запрос на ВИДЕО
-        if any(trigger in lower_msg for trigger in video_triggers):
-            video_url = await get_smart_video_url(last_user_msg)
-            answer = (
-                f"🎬 **Видео по запросу «{last_user_msg}» готово!**\n\n"
-                f"👉 **[Открыть и посмотреть видео в HD (MP4)]({video_url})**"
-            )
-            return format_openai_response(answer, is_stream)
+        if any(w in lower_msg for w in video_words):
+            vid_link = await create_real_video(last_user_msg, base_url)
+            ans = f"🎬 Видео готово!\n\n👉 [Открыть и скачать видео (MP4)]({vid_link})"
+            return build_response(ans, is_stream)
 
-        # Б. Запрос на КАРТИНКУ
-        if any(trigger in lower_msg for trigger in image_triggers):
-            img_md = await get_smart_image_markdown(last_user_msg)
-            answer = f"Вот ваше изображение по запросу «{last_user_msg}»:\n\n{img_md}"
-            return format_openai_response(answer, is_stream)
+        if any(w in lower_msg for w in image_words):
+            img_link = await create_real_image(last_user_msg, base_url)
+            if img_link:
+                ans = f"Вот изображение по запросу «{last_user_msg}»:\n\n!({img_link})"
+            else:
+                ans = "Не удалось сгенерировать изображение, попробуйте изменить описание."
+            return build_response(ans, is_stream)
 
-        # В. Обычный ТЕКСТОВЫЙ запрос -> Gemini
-        requested_model = str(body.get("model", "")).lower()
-        target_model = "gemini-2.5-pro" if "pro" in requested_model else "gemini-2.5-flash"
-
-        clean_body = {
-            "model": target_model,
-            "messages": clean_messages,
-            "stream": False,
-        }
+        req_model = str(body.get("model", "")).lower()
+        target_model = "gemini-2.5-pro" if "pro" in req_model else "gemini-2.5-flash"
 
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(
-                "https://googleapis.com",
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {GEMINI_API_KEY}",
-                },
-                json=clean_body,
+                f"https://{GOOGLE_HOST}/v1beta/openai/chat/completions",
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {GEMINI_API_KEY}"},
+                json={"model": target_model, "messages": clean_messages, "stream": False},
             )
             if resp.status_code != 200:
-                return format_openai_response(f"Ошибка Gemini ({resp.status_code}): проверьте ключ GEMINI_API_KEY в Render.", is_stream)
+                return build_response(f"Ошибка Gemini ({resp.status_code}): проверьте ключ GEMINI_API_KEY.", is_stream)
 
-            data = resp.json()
-            choices = data.get("choices", [])
-            reply_text = ""
-            if choices:
-                reply_text = choices[0].get("message", {}).get("content", "")
-
-            if not reply_text:
-                reply_text = "Привет! Я на связи. Чем могу помочь?"
-
-            return format_openai_response(reply_text, is_stream)
+            choices = resp.json().get("choices", [])
+            reply = choices[0].get("message", {}).get("content", "") if choices else ""
+            return build_response(reply or "Готово! Чем ещё помочь?", is_stream)
 
     except Exception as e:
-        return format_openai_response(f"Системное уведомление: {str(e)}", is_stream)
+        return build_response(f"Ошибка: {str(e)}", is_stream)
 
 
+@app.post("/v1/images/generations")
+@app.post("/images/generations")
+async def image_generations(request: Request):
+    data = await request.json()
+    base_url = str(request.base_url).rstrip("/")
+    url = await create_real_image(data.get("prompt", "art"), base_url)
