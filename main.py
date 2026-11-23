@@ -12,7 +12,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="KROT GPT Multimodal API", version="2.7")
+app = FastAPI(title="KROT GPT Multimodal API", version="Hacker v2.8")
 
 app.add_middleware(
     CORSMiddleware,
@@ -54,7 +54,7 @@ class VideoGenerationRequest(BaseModel):
 async def health_check():
     return {
         "status": "online",
-        "service": "KROT GPT API v2.7",
+        "service": "KROT GPT API v2.8",
         "hf_token_configured": bool(os.getenv("HF_TOKEN")),
         "endpoints": [
             "/v1/chat/completions",
@@ -71,7 +71,7 @@ async def list_models():
         "data": [
             {"id": "krot-gpt-text", "object": "model", "owned_by": "krot"},
             {"id": "krot-flux-image", "object": "model", "owned_by": "krot"},
-            {"id": "krot-ltx-video", "object": "model", "owned_by": "krot"},
+            {"id": "krot-ltx-video", "object": "model", "owned_by": "krot"}
         ]
     }
 
@@ -80,12 +80,11 @@ def extract_text(content: Any) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        texts = [
-            item.get("text", "")
-            for item in content
-            if isinstance(item, dict) and item.get("type") == "text"
-        ]
-        return " ".join(texts)
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(item.get("text", ""))
+        return " ".join(parts)
     return str(content)
 
 
@@ -114,7 +113,7 @@ async def get_free_llm_response(messages: List[Dict[str, str]]) -> str:
                     data = response.json()
                     choices = data.get("choices")
                     if isinstance(choices, list) and len(choices) > 0:
-                        msg = choices.get("message", {})
+                        msg = choices[0].get("message", {})
                         if msg.get("content"):
                             return msg["content"]
                 last_error = f"HTTP {response.status_code}"
@@ -156,7 +155,7 @@ async def image_proxy(prompt: str, width: int = 768, height: int = 768, seed: in
 
             submit_res = await client.post(
                 "https://stablehorde.net",
-                headers={"apikey": "0000000000", "Client-Agent": "KrotGPT:2.7:contact@krot.local"},
+                headers={"apikey": "0000000000", "Client-Agent": "KrotGPT:2.8:contact@krot.local"},
                 json={
                     "prompt": prompt,
                     "params": {"width": w, "height": h, "steps": 20, "n": 1},
@@ -175,23 +174,24 @@ async def image_proxy(prompt: str, width: int = 768, height: int = 768, seed: in
                 await asyncio.sleep(3)
                 check_res = await client.get(
                     f"https://stablehorde.net{job_id}",
-                    headers={"Client-Agent": "KrotGPT:2.7:contact@krot.local"}
+                    headers={"Client-Agent": "KrotGPT:2.8:contact@krot.local"}
                 )
                 if check_res.status_code == 200:
                     status_data = check_res.json()
                     if status_data.get("done"):
                         generations = status_data.get("generations", [])
-                        if isinstance(generations, list) and len(generations) > 0 and generations.get("img"):
-                            img_url = generations["img"]
-                            img_file = await client.get(img_url)
-                            if img_file.status_code == 200:
-                                return Response(
-                                    content=img_file.content,
-                                    media_type=img_file.headers.get("content-type", "image/webp")
-                                )
+                        if isinstance(generations, list) and len(generations) > 0:
+                            img_url = generations[0].get("img")
+                            if img_url:
+                                img_file = await client.get(img_url)
+                                if img_file.status_code == 200:
+                                    return Response(
+                                        content=img_file.content,
+                                        media_type=img_file.headers.get("content-type", "image/webp")
+                                    )
                         break
 
-            raise HTTPException(status_code=504, detail="Очередь бесплатной генерации перегружена, попробуйте ещё раз")
+            raise HTTPException(status_code=504, detail="Очередь генерации перегружена, попробуйте ещё раз")
         except HTTPException:
             raise
         except Exception as e:
@@ -207,7 +207,7 @@ def run_video_worker(task_id: str, prompt: str):
             negative_prompt="low quality, worst quality, deformed, distorted, blurry",
             api_name="/generate"
         )
-        video_url = result if isinstance(result, (list, tuple)) and len(result) > 0 else str(result)
+        video_url = result[0] if isinstance(result, (list, tuple)) and len(result) > 0 else str(result)
         video_tasks[task_id] = {
             "status": "completed",
             "video_url": video_url
@@ -215,7 +215,7 @@ def run_video_worker(task_id: str, prompt: str):
     except Exception as e:
         video_tasks[task_id] = {
             "status": "failed",
-            "error": f"Бесплатный сервер видео перегружен: {str(e)}"
+            "error": f"Сервер видео перегружен: {str(e)}"
         }
 
 
@@ -242,7 +242,7 @@ async def chat_completions(req: ChatCompletionRequest, background_tasks: Backgro
             en_prompt = await get_free_llm_response([
                 {
                     "role": "system",
-                    "content": "Translate the image description into a detailed English prompt for FLUX image generator. Output ONLY the English prompt, no quotes or extra text."
+                    "content": "Translate the image description into a detailed English prompt for FLUX. Output ONLY English words."
                 },
                 {"role": "user", "content": clean_prompt}
             ])
