@@ -1,3 +1,4 @@
+import json
 import time
 import uuid
 import urllib.parse
@@ -5,10 +6,11 @@ from typing import List, Optional, Dict, Any
 
 import httpx
 from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="KROT GPT Multimodal API", version="2.2")
+app = FastAPI(title="KROT GPT Multimodal API", version="Hacker2.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -25,16 +27,13 @@ video_tasks: Dict[str, Dict[str, Any]] = {}
 
 class Message(BaseModel):
     role: str
-    content: Any  # Any, чтобы не падало, если виджет шлет массив с файлами/картинками
+    content: Any
 
 class ChatCompletionRequest(BaseModel):
     model: Optional[str] = "openai"
     messages: List[Message]
     temperature: Optional[float] = 0.7
     stream: Optional[bool] = False
-
-class SimpleChatRequest(BaseModel):
-    message: str
 
 class ImageGenerationRequest(BaseModel):
     prompt: str
@@ -53,7 +52,7 @@ class VideoGenerationRequest(BaseModel):
 async def health_check():
     return {
         "status": "online",
-        "service": "KROT GPT API v2.2",
+        "service": "KROT GPT API v2.3",
         "endpoints": [
             "/v1/chat/completions",
             "/v1/images/generations",
@@ -92,11 +91,10 @@ def build_image_url(prompt: str, width: int = 1024, height: int = 1024, model: s
     )
 
 async def get_free_llm_response(messages: List[Dict[str, str]]) -> str:
-    fallback_models = ["openai", "mistral", "llama"]
     last_error = ""
-
     async with httpx.AsyncClient(timeout=40.0) as client:
-        for model_name in fallback_models:
+        # 1. Пробуем OpenAI-совместимый шлюз Pollinations
+        for model_name in ["openai", "mistral", "llama"]:
             try:
                 response = await client.post(
                     "https://pollinations.ai",
@@ -105,12 +103,16 @@ async def get_free_llm_response(messages: List[Dict[str, str]]) -> str:
                 )
                 if response.status_code == 200:
                     data = response.json()
-                    if isinstance(data, dict) and "choices" in data and len(data["choices"]) > 0:
-                        return data["choices"][0]["message"]["content"]
-                last_error = f"HTTP {response.status_code}: {response.text[:150]}"
+                    choices = data.get("choices")
+                    if isinstance(choices, list) and len(choices) > 0:
+                        msg = choices[0].get("message", {})
+                        if msg.get("content"):
+                            return msg["content"]
+                last_error = f"HTTP {response.status_code}"
             except Exception as e:
                 last_error = str(e)
 
+        # 2. Резервный прямой GET-метод (работает даже при сбое JSON-шлюза)
         try:
             last_user_msg = messages[-1]["content"] if messages else "Привет"
             encoded = urllib.parse.quote(last_user_msg)
@@ -120,10 +122,10 @@ async def get_free_llm_response(messages: List[Dict[str, str]]) -> str:
         except Exception as e:
             last_error = str(e)
 
-    raise RuntimeError(f"Шлюзы недоступны: {last_error}")
+    return f"Временная перегрузка бесплатного шлюза ({last_error}). Попробуйте повторить запрос через 5 секунд."
 
 
-# --- 1. ТЕКСТОВЫЙ ЧАТ + УМНОЕ АВТО-РИСОВАНИЕ ---
+# --- 1. ТЕКСТОВЫЙ ЧАТ + МГНОВЕННОЕ РИСОВАНИЕ ---
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest):
@@ -135,21 +137,45 @@ async def chat_completions(req: ChatCompletionRequest):
         last_text = formatted_messages[-1]["content"].strip() if formatted_messages else ""
         lower_text = last_text.lower()
 
-        # Проверяем, просит ли пользователь нарисовать картинку прямо в обычном чате
         draw_triggers = ("нарисуй", "сгенерируй картинку", "сгенерируй изображение", "создай картинку", "draw ")
         if any(lower_text.startswith(trigger) for trigger in draw_triggers):
-            # Переводим запрос на английский для лучшего качества Flux
-            en_prompt = await get_free_llm_response([
-                {
-                    "role": "system",
-                    "content": "Translate the user image request into a detailed English image generation prompt. Reply ONLY with the English prompt, no extra words."
-                },
-                {"role": "user", "content": last_text}
-            ])
-            img_url = build_image_url(en_prompt.strip())
-            reply_text = f"Вот ваше изображение по запросу «{last_text}»:\n\n![Изображение]({img_url})\n\n[Открыть картинку в полном размере]({img_url})"
+            # Убираем слово "нарисуй" из начала для чистого промпта
+            clean_prompt = last_text
+            for trigger in draw_triggers:
+                if lower_text.startswith(trigger):
+                    clean_prompt = last_text[len(trigger):].strip() or last_text
+                    break
+            img_url = build_image_url(clean_prompt)
+            reply_text = (
+                f"Готово! Изображение по запросу «{clean_prompt}»:\n\n"
+                f"![Изображение]({img_url})\n\n"
+                f"[Открыть в полном размере]({img_url})"
+            )
         else:
             reply_text = await get_free_llm_response(formatted_messages)
+
+        # Если виджет на Tilda запрашивает потоковый ответ (stream: true)
+        if req.stream:
+            async def event_stream():
+                chunk = {
+                    "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": req.model or "krot-gpt-text",
+                    "choices": [{"index": 0, "delta": {"content": reply_text}, "finish_reason": None}]
+                }
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                done_chunk = {
+                    "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": req.model or "krot-gpt-text",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                }
+                yield f"data: {json.dumps(done_chunk, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(event_stream(), media_type="text/event-stream")
 
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
@@ -167,15 +193,6 @@ async def chat_completions(req: ChatCompletionRequest):
                 }
             ]
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/chat")
-async def simple_chat(req: SimpleChatRequest):
-    try:
-        reply_text = await get_free_llm_response([{"role": "user", "content": req.message}])
-        return {"reply": reply_text, "response": reply_text}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -216,7 +233,7 @@ def run_video_worker(task_id: str, prompt: str):
             negative_prompt="low quality, worst quality, deformed, distorted, blurry",
             api_name="/generate"
         )
-        video_url = result[0] if isinstance(result, (list, tuple)) else str(result)
+        video_url = result[0] if isinstance(result, (list, tuple)) and len(result) > 0 else str(result)
         video_tasks[task_id] = {
             "status": "completed",
             "video_url": video_url
