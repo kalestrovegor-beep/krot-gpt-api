@@ -8,11 +8,11 @@ from typing import List, Optional, Dict, Any
 
 import httpx
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Response, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="KROT GPT API", version="Hacker v3.3")
+app = FastAPI(title="KROT GPT API", version="Hacker 3.4")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 video_tasks: Dict[str, Dict[str, Any]] = {}
@@ -47,14 +47,14 @@ def last_item(items: Any, default: Any = None) -> Any:
 async def health_check(request: Request):
     return {
         "status": "online",
-        "service": "KROT GPT API v3.3",
+        "service": "KROT GPT API v3.4",
         "base_url": str(request.base_url).rstrip("/"),
         "hf_token": bool(os.getenv("HF_TOKEN"))
     }
 
 @app.get("/v1/models")
 async def list_models():
-    return {"object": "list", "data": [{"id": "krot-gpt-text", "object": "model"}, {"id": "krot-flux-image", "object": "model"}, {"id": "krot-ltx-video", "object": "model"}]}
+    return {"object": "list", "data": [{"id": "krot-gpt-text", "object": "model"}, {"id": "krot-flux-image", "object": "model"}, {"id": "krot-wan-video", "object": "model"}]}
 
 def extract_text(content: Any) -> str:
     if isinstance(content, str):
@@ -131,13 +131,56 @@ async def image_proxy(prompt: str, width: int = 768, height: int = 768, seed: in
     except Exception as space_err:
         raise HTTPException(status_code=502, detail=f"Ошибка генерации. HF Router: {hf_err} | HF Space: {str(space_err)[:150]}")
 
-def run_video(task_id: str, prompt: str):
-    try:
-        from gradio_client import Client
-        res = Client("Lightricks/LTX-Video").predict(prompt=prompt, negative_prompt="blurry, low quality", api_name="/generate")
-        video_tasks[task_id] = {"status": "completed", "video_url": str(first_item(res, res) if isinstance(res, (list, tuple)) else res)}
-    except Exception as e:
-        video_tasks[task_id] = {"status": "failed", "error": str(e)}
+def run_video(task_id: str, prompt: str, base_url: str):
+    from gradio_client import Client
+    hf = os.getenv("HF_TOKEN", "").strip()
+    token_arg = hf if hf else None
+    last_err = ""
+
+    # Пробуем актуальные публичные Space для генерации видео по очереди
+    video_spaces = [
+        ("Wan-AI/Wan2.1", "/t2v_generation"),
+        ("Lightricks/ltx-video-distilled", "/generate"),
+        ("zai-org/CogVideoX-5B-Space", "/generate")
+    ]
+
+    for space_name, endpoint in video_spaces:
+        try:
+            client = Client(space_name, token=token_arg)
+            if "Wan" in space_name:
+                res = client.predict(prompt=prompt, api_name=endpoint)
+            else:
+                res = client.predict(prompt=prompt, negative_prompt="blurry, low quality", api_name=endpoint)
+
+            raw = first_item(res, res) if isinstance(res, (list, tuple)) else res
+            if isinstance(raw, dict):
+                raw = raw.get("video") or raw.get("path") or raw.get("url")
+
+            file_path = str(raw)
+            if os.path.exists(file_path):
+                video_tasks[task_id] = {
+                    "status": "completed",
+                    "file_path": file_path,
+                    "video_url": f"{base_url}/v1/videos/file/{task_id}"
+                }
+                return
+            elif file_path.startswith("http"):
+                video_tasks[task_id] = {
+                    "status": "completed",
+                    "video_url": file_path
+                }
+                return
+        except Exception as e:
+            last_err = f"{space_name}: {str(e)[:140]}"
+
+    video_tasks[task_id] = {"status": "failed", "error": f"Все видео-серверы сейчас заняты. Детали: {last_err}"}
+
+@app.get("/v1/videos/file/{task_id}")
+async def get_video_file(task_id: str):
+    task = video_tasks.get(task_id)
+    if not task or not task.get("file_path") or not os.path.exists(task["file_path"]):
+        raise HTTPException(status_code=404, detail="Видеофайл не найден или удалён")
+    return FileResponse(task["file_path"], media_type="video/mp4")
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, request: Request, bg: BackgroundTasks):
@@ -159,7 +202,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request, bg: Bac
         en = await ask_llm([{"role": "system", "content": "Translate to short English video prompt. Output ONLY English words."}, {"role": "user", "content": clean}])
         tid = str(uuid.uuid4())
         video_tasks[tid] = {"status": "processing"}
-        bg.add_task(run_video, tid, en if "перегружен" not in en else clean)
+        bg.add_task(run_video, tid, en if "перегружен" not in en else clean, base_url)
         reply = f"Видео запущено по запросу «{clean}». Проверьте готовность через 1–2 мин:\n[Статус видео]({base_url}/v1/videos/status/{tid})"
     else:
         reply = await ask_llm(msgs)
@@ -179,18 +222,3 @@ async def gen_image(req: ImageGenerationRequest, request: Request):
         base_url = "https://" + base_url[7:]
     return {"created": int(time.time()), "data": [{"url": make_img_url(base_url, req.prompt)}]}
 
-@app.post("/v1/videos/generations")
-async def gen_video(req: VideoGenerationRequest, request: Request, bg: BackgroundTasks):
-    base_url = str(request.base_url).rstrip("/")
-    if base_url.startswith("http://"):
-        base_url = "https://" + base_url[7:]
-    tid = str(uuid.uuid4())
-    video_tasks[tid] = {"status": "processing"}
-    bg.add_task(run_video, tid, req.prompt)
-    return {"task_id": tid, "status": "processing", "check_url": f"{base_url}/v1/videos/status/{tid}"}
-
-@app.get("/v1/videos/status/{task_id}")
-async def video_status(task_id: str):
-    if task_id not in video_tasks:
-        raise HTTPException(status_code=404, detail="Not found")
-    return video_tasks[task_id]
