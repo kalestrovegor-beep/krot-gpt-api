@@ -9,7 +9,6 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 app = FastAPI()
 
-# Настройка CORS для работы с вашим сайтом на Tilda без блокировок браузера
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,13 +21,11 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 HF_TOKEN = os.getenv("HF_TOKEN", "")
 
 
-# Проверка работоспособности сервера при открытии ссылки в браузере
 @app.get("/")
 async def root():
     return {"status": "ok", "service": "KROT GPT API Gateway"}
 
 
-# Список моделей для OpenAI-совместимых интерфейсов
 @app.get("/v1/models")
 @app.get("/models")
 async def list_models():
@@ -42,51 +39,8 @@ async def list_models():
     }
 
 
-# 1. ТЕКСТОВЫЙ ЧАТ (поддерживает обычный и потоковый stream режим)
-@app.post("/v1/chat/completions")
-@app.post("/chat/completions")
-async def chat_completions(request: Request):
-    body = await request.json()
-    requested_model = str(body.get("model", "")).lower()
-
-    # Подменяем названия моделей из меню сайта на рабочие модели Gemini
-    if "pro" in requested_model:
-        body["model"] = "gemini-2.5-pro"
-    else:
-        body["model"] = "gemini-2.5-flash"
-
-    # Удаляем параметры OpenAI, которые не принимает Gemini
-    for unsupported in ["frequency_penalty", "presence_penalty", "logit_bias", "user", "reasoning_effort"]:
-        body.pop(unsupported, None)
-
-    is_stream = body.get("stream", False)
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {GEMINI_API_KEY}",
-    }
-    url = "https://googleapis.com"
-
-    if is_stream:
-        async def event_stream():
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                async with client.stream("POST", url, headers=headers, json=body) as resp:
-                    async for chunk in resp.aiter_bytes():
-                        yield chunk
-
-        return StreamingResponse(event_stream(), media_type="text/event-stream")
-
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(url, headers=headers, json=body)
-        return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
-
-
-# 2. ГЕНЕРАЦИЯ КАРТИНОК (Hugging Face Flux-1 Schnell)
-@app.post("/v1/images/generations")
-@app.post("/images/generations")
-async def image_generations(request: Request):
-    data = await request.json()
-    prompt = data.get("prompt", "")
-
+# Вспомогательная функция генерации картинки через Hugging Face
+async def generate_flux_image(prompt: str) -> str:
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(
             "https://huggingface.co",
@@ -94,13 +48,93 @@ async def image_generations(request: Request):
             json={"inputs": prompt},
         )
         if resp.status_code != 200:
-            return JSONResponse(status_code=resp.status_code, content={"error": resp.text})
+            raise Exception(f"HF Error {resp.status_code}: {resp.text}")
+        return base64.b64encode(resp.content).decode("utf-8")
 
-        b64_img = base64.b64encode(resp.content).decode("utf-8")
+
+# 1. ЕДИНЫЙ ЧАТ (Текст + Авто-генерация картинок по словам "нарисуй" / "сгенерируй фото")
+@app.post("/v1/chat/completions")
+@app.post("/chat/completions")
+async def chat_completions(request: Request):
+    body = await request.json()
+    messages = body.get("messages", [])
+    last_user_msg = ""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            content = m.get("content", "")
+            last_user_msg = content if isinstance(content, str) else str(content)
+            break
+
+    # Проверяем, просит ли пользователь нарисовать картинку
+    lower_msg = last_user_msg.lower()
+    image_triggers = ["нарисуй", "сгенерируй картинку", "сгенерируй фото", "создай изображение", "draw "]
+    if any(trigger in lower_msg for trigger in image_triggers):
+        try:
+            # Переводим промпт на английский через Gemini для лучшего качества Flux
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                tr_resp = await client.post(
+                    "https://googleapis.com",
+                    headers={"Authorization": f"Bearer {GEMINI_API_KEY}"},
+                    json={
+                        "model": "gemini-2.5-flash",
+                        "messages": [
+                            {"role": "system", "content": "Translate image prompt to English. Return ONLY the English prompt, nothing else."},
+                            {"role": "user", "content": last_user_msg},
+                        ],
+                    },
+                )
+                en_prompt = tr_resp.json()["choices"][0]["message"]["content"].strip()
+
+            b64_img = await generate_flux_image(en_prompt)
+            md_answer = f"Вот ваше изображение по запросу «{last_user_msg}»:\n\n![generated](data:image/png;base64,{b64_img})"
+
+            return {
+                "id": "chatcmpl-img",
+                "object": "chat.completion",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": md_answer}, "finish_reason": "stop"}],
+            }
+        except Exception as e:
+            return {
+                "id": "chatcmpl-err",
+                "object": "chat.completion",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": f"Ошибка генерации картинки: {str(e)}"}, "finish_reason": "stop"}],
+            }
+
+    # Обычный текстовый запрос -> направляем в Gemini
+    requested_model = str(body.get("model", "")).lower()
+    body["model"] = "gemini-2.5-pro" if "pro" in requested_model else "gemini-2.5-flash"
+
+    # Отключаем stream на стороне прокси, чтобы избежать пустых чанков в интерфейсе Tilda
+    body["stream"] = False
+    for unsupported in ["frequency_penalty", "presence_penalty", "logit_bias", "user", "reasoning_effort", "stream_options"]:
+        body.pop(unsupported, None)
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(
+            "https://googleapis.com",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {GEMINI_API_KEY}",
+            },
+            json=body,
+        )
+        return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
+
+
+# 2. ОТДЕЛЬНЫЙ ЭНДПОИНТ ДЛЯ КАРТИНОК
+@app.post("/v1/images/generations")
+@app.post("/images/generations")
+async def image_generations(request: Request):
+    data = await request.json()
+    prompt = data.get("prompt", "")
+    try:
+        b64_img = await generate_flux_image(prompt)
         return {"data": [{"b64_json": b64_img}]}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 
-# 3. ГЕНЕРАЦИЯ ВИДЕО (Hugging Face Text-to-Video)
+# 3. ОТДЕЛЬНЫЙ ЭНДПОИНТ ДЛЯ ВИДЕО
 @app.post("/v1/video/generations")
 @app.post("/video/generations")
 async def video_generations(request: Request):
