@@ -12,7 +12,7 @@ from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="KROT GPT API", version="Hacker 3.4")
+app = FastAPI(title="KROT GPT API", version="Hacker v3.6")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 video_tasks: Dict[str, Dict[str, Any]] = {}
@@ -47,7 +47,7 @@ def last_item(items: Any, default: Any = None) -> Any:
 async def health_check(request: Request):
     return {
         "status": "online",
-        "service": "KROT GPT API v3.4",
+        "service": "KROT GPT API v3.6",
         "base_url": str(request.base_url).rstrip("/"),
         "hf_token": bool(os.getenv("HF_TOKEN"))
     }
@@ -109,7 +109,6 @@ def generate_via_hf_space(prompt: str, seed: int, w: int, h: int) -> bytes:
 @app.get("/v1/image-proxy")
 async def image_proxy(prompt: str, width: int = 768, height: int = 768, seed: int = 42):
     hf = os.getenv("HF_TOKEN", "").strip()
-    hf_err = "нет токена"
 
     async with httpx.AsyncClient(timeout=90.0, follow_redirects=True) as client:
         if hf:
@@ -121,15 +120,39 @@ async def image_proxy(prompt: str, width: int = 768, height: int = 768, seed: in
                 )
                 if r.status_code == 200 and r.headers.get("content-type", "").startswith("image/"):
                     return Response(content=r.content, media_type=r.headers["content-type"])
-                hf_err = f"HF {r.status_code}: {r.text[:120]}"
-            except Exception as e:
-                hf_err = str(e)
+            except Exception:
+                pass
 
-    try:
-        img_bytes = await asyncio.to_thread(generate_via_hf_space, prompt, seed, width, height)
-        return Response(content=img_bytes, media_type="image/webp")
-    except Exception as space_err:
-        raise HTTPException(status_code=502, detail=f"Ошибка генерации. HF Router: {hf_err} | HF Space: {str(space_err)[:150]}")
+        try:
+            img_bytes = await asyncio.to_thread(generate_via_hf_space, prompt, seed, width, height)
+            return Response(content=img_bytes, media_type="image/webp")
+        except Exception:
+            pass
+
+        try:
+            w = max(512, min(768, (width // 64) * 64))
+            h = max(512, min(768, (height // 64) * 64))
+            sub = await client.post(
+                "https://stablehorde.net",
+                headers={"apikey": "0000000000", "Client-Agent": "KrotGPT:3.6:contact@krot.ai"},
+                json={"prompt": prompt, "models": ["Flux.1-Schnell fp8"], "params": {"width": w, "height": h, "steps": 4, "n": 1}, "nsfw": False, "r2": True}
+            )
+            if sub.status_code == 202:
+                jid = sub.json().get("id")
+                for _ in range(25):
+                    await asyncio.sleep(3)
+                    chk = await client.get(f"https://stablehorde.net{jid}", headers={"Client-Agent": "KrotGPT:3.6:contact@krot.ai"})
+                    if chk.status_code == 200 and chk.json().get("done"):
+                        url = first_item(chk.json().get("generations"), {}).get("img")
+                        if url:
+                            img = await client.get(url)
+                            if img.status_code == 200:
+                                return Response(content=img.content, media_type=img.headers.get("content-type", "image/webp"))
+                        break
+        except Exception:
+            pass
+
+    raise HTTPException(status_code=502, detail="Все бесплатные генераторы сейчас заняты. Повторите через 10 секунд.")
 
 def run_video(task_id: str, prompt: str, base_url: str):
     from gradio_client import Client
@@ -137,7 +160,6 @@ def run_video(task_id: str, prompt: str, base_url: str):
     token_arg = hf if hf else None
     last_err = ""
 
-    # Пробуем актуальные публичные Space для генерации видео по очереди
     video_spaces = [
         ("Wan-AI/Wan2.1", "/t2v_generation"),
         ("Lightricks/ltx-video-distilled", "/generate"),
@@ -173,7 +195,7 @@ def run_video(task_id: str, prompt: str, base_url: str):
         except Exception as e:
             last_err = f"{space_name}: {str(e)[:140]}"
 
-    video_tasks[task_id] = {"status": "failed", "error": f"Все видео-серверы сейчас заняты. Детали: {last_err}"}
+    video_tasks[task_id] = {"status": "failed", "error": f"Все видео-серверы сейчас заняты или исчерпан лимит ZeroGPU. Детали: {last_err}"}
 
 @app.get("/v1/videos/file/{task_id}")
 async def get_video_file(task_id: str):
@@ -203,22 +225,3 @@ async def chat_completions(req: ChatCompletionRequest, request: Request, bg: Bac
         tid = str(uuid.uuid4())
         video_tasks[tid] = {"status": "processing"}
         bg.add_task(run_video, tid, en if "перегружен" not in en else clean, base_url)
-        reply = f"Видео запущено по запросу «{clean}». Проверьте готовность через 1–2 мин:\n[Статус видео]({base_url}/v1/videos/status/{tid})"
-    else:
-        reply = await ask_llm(msgs)
-
-    if req.stream:
-        async def gen():
-            yield f"data: {json.dumps({'id': 'chatcmpl-1', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': 'krot', 'choices': [{'index': 0, 'delta': {'content': reply}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
-            yield f"data: {json.dumps({'id': 'chatcmpl-1', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': 'krot', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]}, ensure_ascii=False)}\n\n"
-            yield "data: [DONE]\n\n"
-        return StreamingResponse(gen(), media_type="text/event-stream")
-    return {"id": "chatcmpl-1", "object": "chat.completion", "created": int(time.time()), "model": "krot", "choices": [{"index": 0, "message": {"role": "assistant", "content": reply}, "finish_reason": "stop"}]}
-
-@app.post("/v1/images/generations")
-async def gen_image(req: ImageGenerationRequest, request: Request):
-    base_url = str(request.base_url).rstrip("/")
-    if base_url.startswith("http://"):
-        base_url = "https://" + base_url[7:]
-    return {"created": int(time.time()), "data": [{"url": make_img_url(base_url, req.prompt)}]}
-
