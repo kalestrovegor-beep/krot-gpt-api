@@ -5,12 +5,12 @@ import urllib.parse
 from typing import List, Optional, Dict, Any
 
 import httpx
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Response
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="KROT GPT Multimodal API", version="Hacker2.3")
+app = FastAPI(title="KROT GPT Multimodal API", version="Hacker v2.4")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,6 +21,9 @@ app.add_middleware(
 )
 
 video_tasks: Dict[str, Dict[str, Any]] = {}
+
+# Адрес вашего собственного сервера Render (чтобы картинки отдавались через него без сбоев)
+SELF_BASE_URL = "https://krot-gpt-api.onrender.com"
 
 
 # --- МОДЕЛИ ДАННЫХ ---
@@ -52,7 +55,7 @@ class VideoGenerationRequest(BaseModel):
 async def health_check():
     return {
         "status": "online",
-        "service": "KROT GPT API v2.3",
+        "service": "KROT GPT API v2.4",
         "endpoints": [
             "/v1/chat/completions",
             "/v1/images/generations",
@@ -82,22 +85,24 @@ def extract_text(content: Any) -> str:
         return " ".join(texts)
     return str(content)
 
-def build_image_url(prompt: str, width: int = 1024, height: int = 1024, model: str = "flux") -> str:
+def build_proxy_image_url(prompt: str, width: int = 1024, height: int = 1024, model: str = "flux") -> str:
     encoded_prompt = urllib.parse.quote(prompt)
     seed = uuid.uuid4().int % 1000000
+    # Возвращаем ссылку на наш же сервер Render, который сам скачает и отдаст картинку
     return (
-        f"https://pollinations.ai{encoded_prompt}"
-        f"?width={width}&height={height}&seed={seed}&model={model}&nologo=true"
+        f"{SELF_BASE_URL}/v1/image-proxy"
+        f"?prompt={encoded_prompt}&width={width}&height={height}&seed={seed}&model={model}"
     )
 
 async def get_free_llm_response(messages: List[Dict[str, str]]) -> str:
     last_error = ""
+    pollinations_text_host = "https://text." + "pollinations" + ".ai"
+
     async with httpx.AsyncClient(timeout=40.0) as client:
-        # 1. Пробуем OpenAI-совместимый шлюз Pollinations
         for model_name in ["openai", "mistral", "llama"]:
             try:
                 response = await client.post(
-                    "https://pollinations.ai",
+                    f"{pollinations_text_host}/openai",
                     json={"model": model_name, "messages": messages},
                     headers={"Content-Type": "application/json"}
                 )
@@ -112,17 +117,35 @@ async def get_free_llm_response(messages: List[Dict[str, str]]) -> str:
             except Exception as e:
                 last_error = str(e)
 
-        # 2. Резервный прямой GET-метод (работает даже при сбое JSON-шлюза)
         try:
             last_user_msg = messages[-1]["content"] if messages else "Привет"
             encoded = urllib.parse.quote(last_user_msg)
-            fallback_res = await client.get(f"https://pollinations.ai{encoded}")
+            fallback_res = await client.get(f"{pollinations_text_host}/{encoded}")
             if fallback_res.status_code == 200 and fallback_res.text.strip():
                 return fallback_res.text.strip()
         except Exception as e:
             last_error = str(e)
 
     return f"Временная перегрузка бесплатного шлюза ({last_error}). Попробуйте повторить запрос через 5 секунд."
+
+
+# --- ПРОКСИ ДЛЯ КАРТИНОК (Render сам забирает картинку и отдаёт браузеру) ---
+
+@app.get("/v1/image-proxy")
+async def image_proxy(prompt: str, width: int = 1024, height: int = 1024, seed: int = 42, model: str = "flux"):
+    encoded_prompt = urllib.parse.quote(prompt)
+    img_host = "https://image." + "pollinations" + ".ai"
+    target_url = f"{img_host}/prompt/{encoded_prompt}?width={width}&height={height}&seed={seed}&model={model}&nologo=true"
+
+    async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+        try:
+            res = await client.get(target_url)
+            if res.status_code == 200:
+                content_type = res.headers.get("content-type", "image/jpeg")
+                return Response(content=res.content, media_type=content_type)
+            raise HTTPException(status_code=res.status_code, detail="Не удалось сгенерировать изображение")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Ошибка генерации: {str(e)}")
 
 
 # --- 1. ТЕКСТОВЫЙ ЧАТ + МГНОВЕННОЕ РИСОВАНИЕ ---
@@ -139,13 +162,12 @@ async def chat_completions(req: ChatCompletionRequest):
 
         draw_triggers = ("нарисуй", "сгенерируй картинку", "сгенерируй изображение", "создай картинку", "draw ")
         if any(lower_text.startswith(trigger) for trigger in draw_triggers):
-            # Убираем слово "нарисуй" из начала для чистого промпта
             clean_prompt = last_text
             for trigger in draw_triggers:
                 if lower_text.startswith(trigger):
                     clean_prompt = last_text[len(trigger):].strip() or last_text
                     break
-            img_url = build_image_url(clean_prompt)
+            img_url = build_proxy_image_url(clean_prompt)
             reply_text = (
                 f"Готово! Изображение по запросу «{clean_prompt}»:\n\n"
                 f"![Изображение]({img_url})\n\n"
@@ -154,7 +176,6 @@ async def chat_completions(req: ChatCompletionRequest):
         else:
             reply_text = await get_free_llm_response(formatted_messages)
 
-        # Если виджет на Tilda запрашивает потоковый ответ (stream: true)
         if req.stream:
             async def event_stream():
                 chunk = {
@@ -211,7 +232,7 @@ async def generate_image(req: ImageGenerationRequest):
         images_data = []
         count = min(max(req.n or 1, 1), 4)
         for _ in range(count):
-            img_url = build_image_url(req.prompt, width, height, req.model or "flux")
+            img_url = build_proxy_image_url(req.prompt, width, height, req.model or "flux")
             images_data.append({"url": img_url})
 
         return {
@@ -249,17 +270,3 @@ def run_video_worker(task_id: str, prompt: str):
 async def create_video(req: VideoGenerationRequest, background_tasks: BackgroundTasks):
     task_id = str(uuid.uuid4())
     video_tasks[task_id] = {"status": "processing"}
-    background_tasks.add_task(run_video_worker, task_id, req.prompt)
-    return {
-        "task_id": task_id,
-        "status": "processing",
-        "check_url": f"/v1/videos/status/{task_id}"
-    }
-
-
-@app.get("/v1/videos/status/{task_id}")
-async def check_video_status(task_id: str):
-    task = video_tasks.get(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Задача не найдена")
-    return task
