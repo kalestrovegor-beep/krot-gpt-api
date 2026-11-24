@@ -1,11 +1,4 @@
-import os
-import io
-import uuid
-import time
-import json
-import base64
-import asyncio
-import httpx
+import os, io, uuid, time, json, base64, asyncio, httpx
 from PIL import Image, ImageFilter
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,7 +6,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 
-app = FastAPI(title="KROT GPT Studio API v4.4")
+app = FastAPI(title="KROT GPT Studio API v4.5")
 
 app.add_middleware(
     CORSMiddleware,
@@ -49,12 +42,7 @@ class ImageProxyRequest(BaseModel):
 
 @app.get("/")
 async def root():
-    return {
-        "status": "ok",
-        "version": "4.4",
-        "groq_ready": bool(GROQ_API_KEY),
-        "hf_ready": bool(HF_TOKEN),
-    }
+    return {"status": "ok", "version": "4.5", "groq": bool(GROQ_API_KEY), "hf": bool(HF_TOKEN)}
 
 
 @app.get("/v1/models")
@@ -85,7 +73,7 @@ async def translate_to_en(text: str) -> str:
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             r = await client.post(
-                "https://api.groq.com" + "/openai/v1/chat/completions",
+                "https://groq.com" + "/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
                 json={
                     "model": "llama-3.1-8b-instant",
@@ -96,7 +84,7 @@ async def translate_to_en(text: str) -> str:
                 },
             )
             if r.status_code == 200:
-                return r.json()["choices"][0]["message"]["content"].strip()
+                return r.json()["choices"]["message"]["content"].strip()
     except Exception:
         pass
     return text
@@ -133,20 +121,12 @@ async def generate_flux_image(prompt: str, make_4k: bool = True) -> Optional[str
     def _space_fallback():
         from gradio_client import Client
         client = Client("black-forest-labs/FLUX.1-schnell", hf_token=HF_TOKEN or None)
-        res = client.predict(
-            prompt=en_prompt,
-            seed=0,
-            randomize_seed=True,
-            width=1024,
-            height=1024,
-            num_inference_steps=4,
-            api_name="/infer",
-        )
-        img_path = res[0] if isinstance(res, (list, tuple)) else res
-        if isinstance(img_path, dict):
-            img_path = img_path.get("path") or img_path.get("url")
-        if img_path and os.path.exists(str(img_path)):
-            with open(img_path, "rb") as f:
+        res = client.predict(prompt=en_prompt, seed=0, randomize_seed=True, width=1024, height=1024, num_inference_steps=4, api_name="/infer")
+        p = res if isinstance(res, (list, tuple)) else res
+        if isinstance(p, dict):
+            p = p.get("path") or p.get("url")
+        if p and os.path.exists(str(p)):
+            with open(p, "rb") as f:
                 return upscale_to_4k_b64(f.read(), make_4k)
         return None
 
@@ -165,77 +145,63 @@ async def image_endpoint(req: ImageProxyRequest):
     return {"url": img_url, "data": [{"url": img_url}]}
 
 
-def run_song_generation_sync(tags: str, lyrics: str) -> str:
+def run_song_sync(tags: str, lyrics: str) -> str:
     from gradio_client import Client
     client = Client("ACE-Step/ACE-Step", hf_token=HF_TOKEN or None)
     res = client.predict(
-        audio_duration=90,
-        prompt=tags,
-        lyrics=lyrics,
-        infer_step=40,
-        guidance_scale=15.0,
-        scheduler_type="euler",
-        cfg_type="apg",
-        omega_scale=10.0,
-        manual_seeds=None,
-        guidance_interval=0.5,
-        guidance_interval_decay=0.0,
-        min_guidance_scale=3.0,
-        use_erg_tag=True,
-        use_erg_lyric=False,
-        use_erg_diffusion=True,
-        oss_steps=None,
-        guidance_scale_text=0.0,
-        guidance_scale_lyric=0.0,
-        api_name="/__call__",
+        audio_duration=90, prompt=tags, lyrics=lyrics, infer_step=40, guidance_scale=15.0,
+        scheduler_type="euler", cfg_type="apg", omega_scale=10.0, manual_seeds=None,
+        guidance_interval=0.5, guidance_interval_decay=0.0, min_guidance_scale=3.0,
+        use_erg_tag=True, use_erg_lyric=False, use_erg_diffusion=True, oss_steps=None,
+        guidance_scale_text=0.0, guidance_scale_lyric=0.0, api_name="/__call__",
     )
-    audio_path = res[0] if isinstance(res, (list, tuple)) else res
-    if isinstance(audio_path, dict):
-        audio_path = audio_path.get("path") or audio_path.get("url")
-    if audio_path and os.path.exists(str(audio_path)):
-        with open(audio_path, "rb") as f:
+    p = res if isinstance(res, (list, tuple)) else res
+    if isinstance(p, dict):
+        p = p.get("path") or p.get("url")
+    if p and os.path.exists(str(p)):
+        with open(p, "rb") as f:
             return "data:audio/mp3;base64," + base64.b64encode(f.read()).decode("utf-8")
-    raise RuntimeError("Аудиофайл не был создан")
+    raise RuntimeError("Аудиофайл не создан")
 
 
 async def write_song_lyrics(topic: str) -> tuple[str, str]:
     if not GROQ_API_KEY:
-        return "pop, electronic, melodic vocals", f"[verse]\n{topic}\n[chorus]\n{topic}"
+        return "pop, synth, vocals", f"[verse]\n{topic}\n[chorus]\n{topic}"
     async with httpx.AsyncClient(timeout=25.0) as client:
         r = await client.post(
-            "https://api.groq.com" + "/openai/v1/chat/completions",
+            "https://groq.com" + "/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
             json={
                 "model": "llama-3.3-70b-versatile",
                 "messages": [
-                    {"role": "system", "content": "Напиши текст песни с тегами [verse], [chorus]. В 1-й строке укажи: STYLE: pop, synth, vocals. Со 2-й строки только текст."},
+                    {"role": "system", "content": "Напиши текст песни с тегами [verse], [chorus]. В 1-й строке напиши: STYLE: pop, synth, vocals. Со 2-й строки только текст."},
                     {"role": "user", "content": topic},
                 ],
             },
         )
         if r.status_code == 200:
-            full = r.json()["choices"][0]["message"]["content"].strip()
+            full = r.json()["choices"]["message"]["content"].strip()
             lines = full.splitlines()
-            if lines and lines[0].upper().startswith("STYLE:"):
-                return lines[0].split(":", 1)[1].strip(), "\n".join(lines[1:]).strip()
+            if lines and lines.upper().startswith("STYLE:"):
+                return lines.split(":", 1).strip(), "\n".join(lines[1:]).strip()
             return "pop, synthwave, melodic vocals", full
-    return "pop, electronic, melodic vocals", topic
+    return "pop, synth, vocals", topic
 
 
-async def background_song_worker(task_id: str, topic: str):
+async def song_worker(task_id: str, topic: str):
     TASKS[task_id]["status"] = "processing"
     try:
         tags, lyrics = await write_song_lyrics(topic)
         TASKS[task_id]["lyrics"] = lyrics
-        audio_url = await asyncio.to_thread(run_song_generation_sync, tags, lyrics)
+        url = await asyncio.to_thread(run_song_sync, tags, lyrics)
         TASKS[task_id]["status"] = "completed"
-        TASKS[task_id]["media_url"] = audio_url
+        TASKS[task_id]["media_url"] = url
     except Exception as e:
         TASKS[task_id]["status"] = "failed"
         TASKS[task_id]["error"] = str(e)
 
 
-def run_video_generation_sync(en_prompt: str) -> str:
+def run_video_sync(en_prompt: str) -> str:
     from gradio_client import Client
     spaces = [
         ("Lightricks/ltx-video-distilled", "/text_to_video", {"prompt": en_prompt, "negative_prompt": "low quality", "height": 512, "width": 704, "num_frames": 65, "seed": 42}),
@@ -246,27 +212,41 @@ def run_video_generation_sync(en_prompt: str) -> str:
         try:
             client = Client(space_id, hf_token=HF_TOKEN or None)
             res = client.predict(**kwargs, api_name=api_name)
-            vid_path = res[0] if isinstance(res, (list, tuple)) else res
-            if isinstance(vid_path, dict):
-                vid_path = vid_path.get("video") or vid_path.get("path") or vid_path.get("url")
-            if vid_path and os.path.exists(str(vid_path)):
-                with open(vid_path, "rb") as f:
+            p = res if isinstance(res, (list, tuple)) else res
+            if isinstance(p, dict):
+                p = p.get("video") or p.get("path") or p.get("url")
+            if p and os.path.exists(str(p)):
+                with open(p, "rb") as f:
                     return "data:video/mp4;base64," + base64.b64encode(f.read()).decode("utf-8")
         except Exception as e:
             errors.append(f"{space_id}: {str(e)}")
     raise RuntimeError(" | ".join(errors))
 
 
-async def background_video_worker(task_id: str, prompt: str):
+async def video_worker(task_id: str, prompt: str):
     TASKS[task_id]["status"] = "processing"
     try:
         en_prompt = await translate_to_en(prompt)
-        vid_url = await asyncio.to_thread(run_video_generation_sync, en_prompt)
+        url = await asyncio.to_thread(run_video_sync, en_prompt)
         TASKS[task_id]["status"] = "completed"
-        TASKS[task_id]["media_url"] = vid_url
+        TASKS[task_id]["media_url"] = url
     except Exception as e:
         TASKS[task_id]["status"] = "failed"
         TASKS[task_id]["error"] = str(e)
 
 
-@app.get("/v1/tasks/{task_id}")
+def format_task_reply(tid: str) -> str:
+    task = TASKS.get(tid)
+    if task is None:
+        return f"Задача `{tid}` не найдена."
+    st = task.get("status")
+    if st == "completed":
+        media = task.get("media_url", "")
+        if task.get("type") == "song":
+            return f"🎵 **Песня готова!**\n\n[Слушать или скачать MP3]({media})\n\n**Текст:**\n{task.get('lyrics', '')}"
+        return f"🎬 **Видео готово!**\n\n[Открыть или скачать MP4]({media})"
+    if st == "failed":
+        return f"❌ Ошибка генерации: {task.get('error')}"
+    return f"⏳ Задача `{tid}` ещё выполняется (`{st}`). Проверь через 30 секунд: `статус {tid}`"
+
+
