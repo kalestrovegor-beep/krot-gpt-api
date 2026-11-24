@@ -21,7 +21,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Автоматически собираем ВСЕ ключи GEMINI_API_KEY* и GROQ_API_KEY* из Render
 GEMINI_KEYS = ["".join(v.split()) for k, v in os.environ.items() if k.startswith("GEMINI_API_KEY") and v.strip()]
 GROQ_KEYS = ["".join(v.split()) for k, v in os.environ.items() if k.startswith("GROQ_API_KEY") and v.strip()]
 HF_TOKEN = "".join(os.getenv("HF_TOKEN", "").split())
@@ -86,7 +85,6 @@ def save_media(raw_bytes: bytes, mime: str, ext: str, base_url: str) -> str:
     return f"{host}/media/{file_id}"
 
 
-# Перевод промпта на английский с перебором всех ключей Gemini
 async def translate_to_english(prompt: str) -> str:
     for key in get_shuffled_keys(GEMINI_KEYS):
         try:
@@ -116,11 +114,9 @@ async def translate_to_english(prompt: str) -> str:
     return prompt
 
 
-# Генерация картинок: сначала все ключи Gemini (Imagen / Gemini Image), при сбое — незаметно Pollinations
 async def create_real_image(prompt: str, base_url: str) -> str:
     en_prompt = await translate_to_english(prompt)
 
-    # 1. Пробуем Gemini Native Image Generation по всем ключам
     for key in get_shuffled_keys(GEMINI_KEYS):
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
@@ -142,7 +138,6 @@ async def create_real_image(prompt: str, base_url: str) -> str:
         except Exception:
             continue
 
-    # 2. Пробуем Google Imagen 3 по всем ключам
     for key in get_shuffled_keys(GEMINI_KEYS):
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
@@ -159,7 +154,6 @@ async def create_real_image(prompt: str, base_url: str) -> str:
         except Exception:
             continue
 
-    # 3. Незаметная резервная подмена через Pollinations (Flux / Turbo)
     for model_name in ["flux", "turbo"]:
         try:
             encoded = urllib.parse.quote(en_prompt)
@@ -175,7 +169,6 @@ async def create_real_image(prompt: str, base_url: str) -> str:
     return ""
 
 
-# Генерация видео: Hugging Face -> незаметная подмена на открытое HD-видео
 async def create_real_video(prompt: str, base_url: str) -> str:
     en_prompt = await translate_to_english(prompt)
 
@@ -213,13 +206,11 @@ async def create_real_video(prompt: str, base_url: str) -> str:
     return next(iter(FALLBACK_VIDEOS), "")
 
 
-# Запрос к Groq для размышлений и сложной логики
 async def ask_groq_reasoning(messages: list) -> str:
     if not GROQ_KEYS:
         return ""
-    groq_models = ["deepseek-r1-distill-llama-70b", "llama-3.3-70b-versatile"]
     for key in get_shuffled_keys(GROQ_KEYS):
-        for g_model in groq_models:
+        for g_model in ["deepseek-r1-distill-llama-70b", "llama-3.3-70b-versatile"]:
             try:
                 async with httpx.AsyncClient(timeout=45.0) as client:
                     resp = await client.post(
@@ -238,7 +229,16 @@ async def ask_groq_reasoning(messages: list) -> str:
     return ""
 
 
-# Запрос к Gemini с перебором всех ключей
 async def ask_gemini_chat(messages: list, model_name: str = "gemini-2.5-flash") -> str:
     for key in get_shuffled_keys(GEMINI_KEYS):
         try:
+            async with httpx.AsyncClient(timeout=50.0) as client:
+                resp = await client.post(
+                    f"https://{GOOGLE_HOST}/v1beta/openai/chat/completions",
+                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+                    json={"model": model_name, "messages": messages, "stream": False},
+                )
+                if resp.status_code == 200:
+                    choices = resp.json().get("choices", [])
+                    first = next(iter(choices), {})
+                    content = first.get("message", {}).get("content", "").strip()
