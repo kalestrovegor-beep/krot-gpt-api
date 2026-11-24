@@ -72,12 +72,12 @@ async def chat_completions(request: Request):
         req_model = str(body.get("model", "")).lower()
 
         if any(w in low for w in ["сгенерируй видео", "создай видео", "сделай видео", "видео про", "generate video"]):
-            vid = await make_video(last_msg, base_url)
-            return send_reply(f"🎬 Видео готово!\n\n👉 [Открыть и посмотреть видео (MP4)]({vid})", is_stream)
+            vid, en_p = await make_video(last_msg, base_url)
+            return send_reply(f"🎬 **Видео готово!**\n*Промпт:* `{en_p}`\n\n👉 [Открыть и посмотреть видео (MP4)]({vid})", is_stream)
 
         if any(w in low for w in ["нарисуй", "сгенерируй картинку", "сгенерируй фото", "создай изображение", "картинку", "draw "]):
-            img = await make_image(last_msg, base_url)
-            ans = f"Вот изображение по запросу «{last_msg}»:\n\n![art]({img})" if img else "Не удалось создать изображение, повторите запрос."
+            img, en_p = await make_image(last_msg, base_url)
+            ans = f"🎨 **Промпт:** `{en_p}`\n\n![art]({img})" if img else "Не удалось создать изображение, повторите запрос."
             return send_reply(ans, is_stream)
 
         if any(k in req_model for k in ["reason", "think", "r1", "pro", "o1"]) or any(w in low for w in ["подумай", "поразмышляй", "реши подробно"]):
@@ -94,14 +94,16 @@ async def chat_completions(request: Request):
 @app.post("/images/generations")
 async def image_generations(request: Request):
     data = await request.json()
-    return {"data": [{"url": await make_image(data.get("prompt", "art"), str(request.base_url).rstrip("/"))}]}
+    url, _ = await make_image(data.get("prompt", "art"), str(request.base_url).rstrip("/"))
+    return {"data": [{"url": url}]}
 
 
 @app.post("/v1/video/generations")
 @app.post("/video/generations")
 async def video_generations(request: Request):
     data = await request.json()
-    return {"data": [{"url": await make_video(data.get("prompt", "nature"), str(request.base_url).rstrip("/"))}]}
+    url, _ = await make_video(data.get("prompt", "nature"), str(request.base_url).rstrip("/"))
+    return {"data": [{"url": url}]}
 
 
 @app.websocket("/v1/live")
