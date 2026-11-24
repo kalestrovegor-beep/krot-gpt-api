@@ -1,12 +1,13 @@
 import os
 import time
 import json
+import base64
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="KROT GPT Clean API v6.0")
+app = FastAPI(title="KROT GPT Clean API v6.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -25,7 +26,7 @@ HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 async def health():
     return {
         "status": "online",
-        "version": "6.0-clean",
+        "version": "6.1-clean",
         "groq": bool(GROQ_API_KEY),
         "gemini": bool(GEMINI_API_KEY),
         "hf": bool(HF_TOKEN),
@@ -53,7 +54,9 @@ def extract_text(content):
 
 
 async def generate_image_clean(prompt: str) -> str:
-    # 1. Пробуем Google Imagen 3 (если добавлен GEMINI_API_KEY)
+    errors = []
+
+    # 1. Google Imagen 3 (если добавлен GEMINI_API_KEY)
     if GEMINI_API_KEY:
         url = f"https://googleapis.com{GEMINI_API_KEY}"
         try:
@@ -65,31 +68,33 @@ async def generate_image_clean(prompt: str) -> str:
                         b64 = preds.get("bytesBase64Encoded")
                         if b64:
                             return f"![Изображение](data:image/png;base64,{b64})"
-        except Exception:
-            pass
+                errors.append(f"Gemini Imagen: {r.status_code}")
+        except Exception as e:
+            errors.append(f"Gemini Imagen: {e}")
 
-    # 2. Пробуем Hugging Face FLUX (если добавлен HF_TOKEN)
+    # 2. Hugging Face FLUX (если добавлен HF_TOKEN с правом Inference Providers)
     if HF_TOKEN:
         url = "https://huggingface.co" + "/hf-inference/models/black-forest-labs/FLUX.1-schnell"
         try:
             async with httpx.AsyncClient(timeout=45.0) as client:
                 r = await client.post(url, headers={"Authorization": f"Bearer {HF_TOKEN}"}, json={"inputs": prompt})
                 if r.status_code == 200 and "image" in r.headers.get("content-type", ""):
-                    import base64
                     b64 = base64.b64encode(r.content).decode("utf-8")
                     return f"![FLUX](data:image/jpeg;base64,{b64})"
-        except Exception:
-            pass
+                errors.append(f"HF FLUX ({r.status_code}): {r.text[:120]}")
+        except Exception as e:
+            errors.append(f"HF FLUX: {e}")
 
-    return "❌ Для генерации картинок добавьте `GEMINI_API_KEY` (бесплатно в Google AI Studio) или рабочий `HF_TOKEN` в Environment на Render."
+    return f"❌ Не удалось создать картинку. Причина: {' | '.join(errors) or 'ключи не заданы'}"
 
 
 async def ask_thinking_ai(messages: list, temp: float) -> tuple[str, str]:
     system_msg = {
         "role": "system",
-        "content": "Ты глубоко мыслящий ИИ-ассистент KROT GPT. Всегда проводи подробный, пошаговый и глубокий разбор задачи.",
+        "content": "Ты глубоко мыслящий ИИ-ассистент KROT GPT. Всегда проводи подробный, пошаговый и глубокий разбор задачи на русском языке.",
     }
     full_msgs = [system_msg] + messages
+    errors = []
 
     # 1. Основной канал: Groq (модель с глубокими размышлениями)
     if GROQ_API_KEY:
@@ -112,6 +117,7 @@ async def ask_thinking_ai(messages: list, temp: float) -> tuple[str, str]:
                 if choices:
                     msg = choices.get("message", {})
                     return msg.get("reasoning", "") or "", msg.get("content", "") or ""
+            errors.append(f"Groq gpt-oss ({r.status_code}): {r.text[:120]}")
 
             # Резервная модель Groq
             r2 = await client.post(
@@ -123,8 +129,9 @@ async def ask_thinking_ai(messages: list, temp: float) -> tuple[str, str]:
                 choices2 = r2.json().get("choices", [])
                 if choices2:
                     return "", choices2.get("message", {}).get("content", "") or ""
+            errors.append(f"Groq llama ({r2.status_code}): {r2.text[:120]}")
 
-    # 2. Резервный канал: Google Gemini 2.5 Flash (если добавлен GEMINI_API_KEY)
+    # 2. Резервный канал: Google Gemini 2.5 Flash
     if GEMINI_API_KEY:
         user_prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
         url = f"https://googleapis.com{GEMINI_API_KEY}"
@@ -136,8 +143,9 @@ async def ask_thinking_ai(messages: list, temp: float) -> tuple[str, str]:
                     parts = cands.get("content", {}).get("parts", [])
                     if parts:
                         return "", parts.get("text", "")
+            errors.append(f"Gemini ({r.status_code}): {r.text[:120]}")
 
-    return "", "⚠️ Проверьте ключ `GROQ_API_KEY` или `GEMINI_API_KEY` в настройках Render."
+    return "", f"⚠️ Ошибка провайдеров: {' | '.join(errors) or 'ключи не найдены'}"
 
 
 @app.post("/v1/chat/completions")
