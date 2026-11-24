@@ -96,6 +96,7 @@ async def make_beautiful_prompt(user_prompt: str, is_video: bool = False) -> str
 async def make_image(prompt: str, base_url: str) -> tuple[str, str]:
     en_prompt = await make_beautiful_prompt(prompt, is_video=False)
 
+    # 1. Пробуем Google Gemini Image Generation
     for key in shuffled(GEMINI_KEYS):
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
@@ -110,16 +111,35 @@ async def make_image(prompt: str, base_url: str) -> tuple[str, str]:
         except Exception:
             continue
 
-    for model_name in ["flux", "turbo"]:
+    # 2. Пробуем Pollinations AI (Flux, Turbo, GPTImage)
+    encoded = urllib.parse.quote(en_prompt)
+    for model_name in ["flux", "turbo", "gptimage"]:
         try:
-            encoded = urllib.parse.quote(en_prompt)
-            img_url = f"https://{POLL_IMG_HOST}/prompt/{encoded}?width=1024&height=768&seed={random.randint(1, 999999)}&model={model_name}&nologo=true"
+            seed = random.randint(1, 999999)
+            img_url = f"https://{POLL_IMG_HOST}/prompt/{encoded}?width=1024&height=768&seed={seed}&model={model_name}&nologo=true&enhance=true"
             async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
                 r = await client.get(img_url)
                 if r.status_code == 200 and len(r.content) > 5000:
                     return save_media(r.content, "image/jpeg", "jpg", base_url), en_prompt
         except Exception:
             continue
+
+    # 3. Резерв через OpenAI DALL-E 3 (если добавлен ключ OPEN_AI)
+    if OPENAI_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=45.0) as client:
+                r = await client.post(
+                    f"https://{OPENAI_HOST}/v1/images/generations",
+                    headers={"Authorization": f"Bearer {OPENAI_KEY}"},
+                    json={"model": "dall-e-3", "prompt": en_prompt, "n": 1, "size": "1024x1024", "response_format": "b64_json"},
+                )
+                if r.status_code == 200:
+                    b64 = next(iter(r.json().get("data", [])), {}).get("b64_json")
+                    if b64:
+                        return save_media(base64.b64decode(b64), "image/png", "png", base_url), en_prompt
+        except Exception:
+            pass
+
     return "", en_prompt
 
 
