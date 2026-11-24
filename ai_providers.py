@@ -7,15 +7,17 @@ import httpx
 
 GEMINI_KEYS = ["".join(v.split()) for k, v in os.environ.items() if k.startswith("GEMINI_API_KEY") and v.strip()]
 GROQ_KEYS = ["".join(v.split()) for k, v in os.environ.items() if k.startswith("GROQ_API_KEY") and v.strip()]
-HF_TOKEN = "".join(os.getenv("HF_TOKEN", "").split())
+OPENAI_KEY = "".join(os.getenv("OPEN_AI", os.getenv("OPENAI_API_KEY", "")).split())
 PUBLIC_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
 
 MEDIA_STORE = {}
 
 GOOGLE_HOST = "generativelanguage." + "googleapis.com"
 GROQ_HOST = "api." + "groq.com"
-POLLINATIONS_HOST = "image." + "pollinations.ai"
-HF_ROUTER_HOST = "router." + "huggingface.co"
+OPENAI_HOST = "api." + "openai.com"
+POLL_IMG_HOST = "image." + "pollinations.ai"
+POLL_TXT_HOST = "text." + "pollinations.ai"
+POLL_GEN_HOST = "gen." + "pollinations.ai"
 W3_HOST = "www." + "w3schools.com"
 
 FALLBACK_VIDEOS = [
@@ -39,98 +41,137 @@ def save_media(raw_bytes: bytes, mime: str, ext: str, base_url: str) -> str:
     return f"{host}/media/{file_id}"
 
 
-async def translate_prompt(prompt: str) -> str:
+async def make_beautiful_prompt(user_prompt: str, is_video: bool = False) -> str:
+    media_type = "cinematic video scene with smooth motion" if is_video else "masterpiece illustration/photo"
+    sys_msg = (
+        f"Convert the user's Russian request into a rich, vivid, detailed English prompt for generating a {media_type}. "
+        "Important: Russian 'крот' means 'cute furry underground mole animal' (never a cat). "
+        "Add lighting, atmosphere, composition, and quality details (max 35 words). Output ONLY the English prompt."
+    )
+    req_msgs = [{"role": "system", "content": sys_msg}, {"role": "user", "content": user_prompt}]
+
     for key in shuffled(GEMINI_KEYS):
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
                 r = await client.post(
                     f"https://{GOOGLE_HOST}/v1beta/openai/chat/completions",
                     headers={"Authorization": f"Bearer {key}"},
-                    json={
-                        "model": "gemini-2.5-flash",
-                        "messages": [
-                            {"role": "system", "content": "Translate to English image prompt. Russian 'крот' = 'cute furry mole animal'. Return ONLY English text."},
-                            {"role": "user", "content": prompt},
-                        ],
-                    },
+                    json={"model": "gemini-2.5-flash", "messages": req_msgs},
                 )
                 if r.status_code == 200:
-                    first = next(iter(r.json().get("choices", [])), {})
-                    txt = first.get("message", {}).get("content", "").strip()
+                    txt = next(iter(r.json().get("choices", [])), {}).get("message", {}).get("content", "").strip()
                     if txt:
                         return txt
         except Exception:
             continue
-    return prompt
+
+    for key in shuffled(GROQ_KEYS):
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await client.post(
+                    f"https://{GROQ_HOST}/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {key}"},
+                    json={"model": "llama-3.3-70b-versatile", "messages": req_msgs},
+                )
+                if r.status_code == 200:
+                    txt = next(iter(r.json().get("choices", [])), {}).get("message", {}).get("content", "").strip()
+                    if txt:
+                        return txt
+        except Exception:
+            continue
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.post(f"https://{POLL_TXT_HOST}/openai", json={"model": "openai", "messages": req_msgs})
+            if r.status_code == 200:
+                txt = next(iter(r.json().get("choices", [])), {}).get("message", {}).get("content", "").strip()
+                if txt:
+                    return txt
+    except Exception:
+        pass
+
+    return user_prompt
 
 
-async def make_image(prompt: str, base_url: str) -> str:
-    en_prompt = await translate_prompt(prompt)
+async def make_image(prompt: str, base_url: str) -> tuple[str, str]:
+    en_prompt = await make_beautiful_prompt(prompt, is_video=False)
+
     for key in shuffled(GEMINI_KEYS):
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 url = f"https://{GOOGLE_HOST}/v1beta/models/gemini-2.0-flash-exp-image-generation:generateContent?key={key}"
-                resp = await client.post(url, json={"contents": [{"parts": [{"text": f"Generate high quality image: {en_prompt}"}]}], "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}})
+                resp = await client.post(url, json={"contents": [{"parts": [{"text": en_prompt}]}], "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}})
                 if resp.status_code == 200:
                     cand = next(iter(resp.json().get("candidates", [])), {})
                     for p in cand.get("content", {}).get("parts", []):
                         b64 = p.get("inlineData", {}).get("data")
                         if b64:
-                            return save_media(base64.b64decode(b64), "image/png", "png", base_url)
+                            return save_media(base64.b64decode(b64), "image/png", "png", base_url), en_prompt
         except Exception:
             continue
 
     for model_name in ["flux", "turbo"]:
         try:
             encoded = urllib.parse.quote(en_prompt)
-            img_url = f"https://{POLLINATIONS_HOST}/prompt/{encoded}?width=1024&height=768&seed={random.randint(1, 999999)}&model={model_name}&nologo=true"
+            img_url = f"https://{POLL_IMG_HOST}/prompt/{encoded}?width=1024&height=768&seed={random.randint(1, 999999)}&model={model_name}&nologo=true"
             async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
                 r = await client.get(img_url)
                 if r.status_code == 200 and len(r.content) > 5000:
-                    return save_media(r.content, "image/jpeg", "jpg", base_url)
+                    return save_media(r.content, "image/jpeg", "jpg", base_url), en_prompt
         except Exception:
             continue
-    return ""
+    return "", en_prompt
 
 
-async def make_video(prompt: str, base_url: str) -> str:
-    en_prompt = await translate_prompt(prompt)
-    if HF_TOKEN:
-        for path in ["fal-ai/fal-ai/fast-svd-lcm", "hf-inference/models/Wan-AI/Wan2.1-T2V-14B"]:
-            try:
-                async with httpx.AsyncClient(timeout=65.0) as client:
-                    r = await client.post(f"https://{HF_ROUTER_HOST}/{path}", headers={"Authorization": f"Bearer {HF_TOKEN}", "Content-Type": "application/json"}, json={"inputs": en_prompt, "prompt": en_prompt})
-                    if r.status_code == 200:
-                        if "video" in r.headers.get("content-type", "") or len(r.content) > 50000:
-                            return save_media(r.content, "video/mp4", "mp4", base_url)
-                        vid_url = r.json().get("video", {}).get("url")
-                        if vid_url:
-                            vr = await client.get(vid_url)
-                            if vr.status_code == 200:
-                                return save_media(vr.content, "video/mp4", "mp4", base_url)
-            except Exception:
-                continue
+async def make_video(prompt: str, base_url: str) -> tuple[str, str]:
+    en_prompt = await make_beautiful_prompt(prompt, is_video=True)
+    encoded = urllib.parse.quote(en_prompt)
+
+    try:
+        vid_api = f"https://{POLL_GEN_HOST}/video/{encoded}?model=wan&duration=4"
+        async with httpx.AsyncClient(timeout=75.0, follow_redirects=True) as client:
+            r = await client.get(vid_api)
+            if r.status_code == 200 and len(r.content) > 40000:
+                return save_media(r.content, "video/mp4", "mp4", base_url), en_prompt
+    except Exception:
+        pass
 
     for sample in shuffled(FALLBACK_VIDEOS):
         try:
             async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
                 v = await client.get(sample)
                 if v.status_code == 200 and len(v.content) > 10000:
-                    return save_media(v.content, "video/mp4", "mp4", base_url)
+                    return save_media(v.content, "video/mp4", "mp4", base_url), en_prompt
         except Exception:
             continue
-    return next(iter(FALLBACK_VIDEOS), "")
+    return next(iter(FALLBACK_VIDEOS), ""), en_prompt
+
+
+async def ask_openai_fallback(messages: list) -> str:
+    if not OPENAI_KEY:
+        return ""
+    try:
+        async with httpx.AsyncClient(timeout=40.0) as client:
+            r = await client.post(
+                f"https://{OPENAI_HOST}/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENAI_KEY}"},
+                json={"model": "gpt-4o-mini", "messages": messages, "stream": False},
+            )
+            if r.status_code == 200:
+                return next(iter(r.json().get("choices", [])), {}).get("message", {}).get("content", "").strip()
+    except Exception:
+        pass
+    return ""
 
 
 async def ask_groq(messages: list) -> str:
     for key in shuffled(GROQ_KEYS):
-        for model in ["deepseek-r1-distill-llama-70b", "llama-3.3-70b-versatile"]:
+        for model in ["qwen-qwq-32b", "llama-3.3-70b-versatile"]:
             try:
                 async with httpx.AsyncClient(timeout=45.0) as client:
                     r = await client.post(f"https://{GROQ_HOST}/openai/v1/chat/completions", headers={"Authorization": f"Bearer {key}"}, json={"model": model, "messages": messages, "stream": False})
                     if r.status_code == 200:
-                        first = next(iter(r.json().get("choices", [])), {})
-                        txt = first.get("message", {}).get("content", "").strip()
+                        txt = next(iter(r.json().get("choices", [])), {}).get("message", {}).get("content", "").strip()
                         if txt:
                             return txt
             except Exception:
@@ -144,10 +185,23 @@ async def ask_gemini(messages: list, model: str = "gemini-2.5-flash") -> str:
             async with httpx.AsyncClient(timeout=50.0) as client:
                 r = await client.post(f"https://{GOOGLE_HOST}/v1beta/openai/chat/completions", headers={"Authorization": f"Bearer {key}"}, json={"model": model, "messages": messages, "stream": False})
                 if r.status_code == 200:
-                    first = next(iter(r.json().get("choices", [])), {})
-                    txt = first.get("message", {}).get("content", "").strip()
+                    txt = next(iter(r.json().get("choices", [])), {}).get("message", {}).get("content", "").strip()
                     if txt:
                         return txt
         except Exception:
             continue
+
+    oa = await ask_openai_fallback(messages)
+    if oa:
+        return oa
+
+    try:
+        async with httpx.AsyncClient(timeout=35.0) as client:
+            r = await client.post(f"https://{POLL_TXT_HOST}/openai", json={"model": "openai", "messages": messages})
+            if r.status_code == 200:
+                txt = next(iter(r.json().get("choices", [])), {}).get("message", {}).get("content", "").strip()
+                if txt:
+                    return txt
+    except Exception:
+        pass
     return ""
