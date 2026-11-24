@@ -2,12 +2,14 @@ import os
 import time
 import json
 import base64
+import asyncio
+import traceback
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="KROT GPT Clean API v6.3")
+app = FastAPI(title="KROT GPT Clean API v6.4")
 
 app.add_middleware(
     CORSMiddleware,
@@ -19,22 +21,20 @@ app.add_middleware(
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 
 GROQ_URL = "/".join(["https:/", "://groq.com", "openai", "v1", "chat", "completions"])
-HF_BASE = "/".join(["https:/", "router.huggingface.co", "hf-inference", "models"])
 GEMINI_CHAT_BASE = "/".join(["https:/", "://googleapis.com", "v1beta", "models", "gemini-2.5-flash:generateContent"])
 GEMINI_IMG_BASE = "/".join(["https:/", "://googleapis.com", "v1beta", "models", "imagen-3.0-generate-002:predict"])
+HORDE_BASE = "/".join(["https:/", "stablehorde.net", "api", "v2", "generate"])
 
 
 @app.get("/")
 async def health():
     return {
         "status": "online",
-        "version": "6.3-clean",
+        "version": "6.4-clean",
         "groq": bool(GROQ_API_KEY),
         "gemini": bool(GEMINI_API_KEY),
-        "hf": bool(HF_TOKEN),
     }
 
 
@@ -77,7 +77,7 @@ async def translate_prompt(text: str) -> str:
                 json={
                     "model": "llama-3.1-8b-instant",
                     "messages": [
-                        {"role": "system", "content": "Translate to vivid English image prompt. Output ONLY English text."},
+                        {"role": "system", "content": "Translate to detailed English image prompt. Output ONLY English text."},
                         {"role": "user", "content": text},
                     ],
                 },
@@ -91,9 +91,10 @@ async def translate_prompt(text: str) -> str:
 
 
 async def generate_image_clean(prompt: str) -> str:
-    errors = []
     en_prompt = await translate_prompt(prompt)
+    errors = []
 
+    # 1. Google Imagen 3 (если задан GEMINI_API_KEY)
     if GEMINI_API_KEY:
         try:
             async with httpx.AsyncClient(timeout=45.0) as client:
@@ -105,39 +106,49 @@ async def generate_image_clean(prompt: str) -> str:
                     pred = first_dict(r.json().get("predictions", []))
                     b64 = pred.get("bytesBase64Encoded")
                     if b64:
-                        return f"![Изображение](data:image/png;base64,{b64})"
-                errors.append(f"Gemini Imagen ({r.status_code})")
+                        return f"![Imagen 3](data:image/png;base64,{b64})"
+                errors.append(f"Imagen ({r.status_code})")
         except Exception as e:
-            errors.append(f"Gemini Imagen: {e}")
+            errors.append(f"Imagen: {e}")
 
-    if HF_TOKEN:
-        hf_models = [
-            "black-forest-labs/FLUX.1-dev",
-            "stabilityai/stable-diffusion-xl-base-1.0",
-            "ByteDance/SDXL-Lightning",
-        ]
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            for m in hf_models:
-                try:
-                    r = await client.post(
-                        f"{HF_BASE}/{m}",
-                        headers={"Authorization": f"Bearer {HF_TOKEN}"},
-                        json={"inputs": en_prompt},
-                    )
-                    if r.status_code == 200 and "image" in r.headers.get("content-type", ""):
-                        b64 = base64.b64encode(r.content).decode("utf-8")
-                        return f"![Изображение](data:image/jpeg;base64,{b64})"
-                    errors.append(f"{m} ({r.status_code}): {r.text[:80]}")
-                except Exception as e:
-                    errors.append(f"{m}: {e}")
+    # 2. Бесплатная сеть AI Horde (FLUX.1-schnell без водяных знаков)
+    headers = {"apikey": "0000000000", "Client-Agent": "KrotGPT:6.4:admin"}
+    payload = {
+        "prompt": en_prompt,
+        "params": {"width": 1024, "height": 1024, "steps": 4, "n": 1},
+        "models": ["Flux.1-Schnell fp8", "AlbedoBase XL (SDXL)"],
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(f"{HORDE_BASE}/async", json=payload, headers=headers)
+            if r.status_code == 202:
+                gen_id = r.json().get("id")
+                for _ in range(25):
+                    await asyncio.sleep(2.5)
+                    chk = await client.get(f"{HORDE_BASE}/check/{gen_id}", headers=headers)
+                    if chk.status_code == 200 and chk.json().get("done"):
+                        st = await client.get(f"{HORDE_BASE}/status/{gen_id}", headers=headers)
+                        gen = first_dict(st.json().get("generations", []))
+                        img_val = gen.get("img", "")
+                        if img_val.startswith("http"):
+                            img_r = await client.get(img_val)
+                            b64 = base64.b64encode(img_r.content).decode("utf-8")
+                            return f"![FLUX](data:image/webp;base64,{b64})"
+                        elif img_val:
+                            return f"![FLUX](data:image/webp;base64,{img_val})"
+                errors.append("AI Horde: очередь перегружена")
+            else:
+                errors.append(f"AI Horde ({r.status_code})")
+    except Exception as e:
+        errors.append(f"AI Horde: {e}")
 
-    return f"❌ Не удалось создать картинку: {' | '.join(errors) or 'ключи не заданы'}"
+    return f"❌ Не удалось создать картинку ({' | '.join(errors)})."
 
 
 async def ask_thinking_ai(messages: list, temp: float) -> tuple[str, str]:
     system_msg = {
         "role": "system",
-        "content": "Ты глубоко мыслящий ИИ-ассистент KROT GPT. Всегда проводи подробный, пошаговый и глубокий разбор задачи на русском языке.",
+        "content": "Ты глубоко мыслящий ИИ-ассистент KROT GPT. Проводи подробный, глубокий разбор задачи на русском языке.",
     }
     full_msgs = [system_msg] + messages
     errors = []
@@ -145,64 +156,80 @@ async def ask_thinking_ai(messages: list, temp: float) -> tuple[str, str]:
     if GROQ_API_KEY:
         headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
         async with httpx.AsyncClient(timeout=60.0) as client:
-            r = await client.post(
-                GROQ_URL,
-                headers=headers,
-                json={
-                    "model": "openai/gpt-oss-120b",
-                    "messages": full_msgs,
-                    "reasoning_format": "parsed",
-                    "reasoning_effort": "high",
-                    "temperature": temp,
-                },
-            )
-            if r.status_code == 200:
-                msg = first_dict(r.json().get("choices", [])).get("message", {})
-                return msg.get("reasoning", "") or "", msg.get("content", "") or ""
-            errors.append(f"Groq gpt-oss ({r.status_code}): {r.text[:100]}")
+            try:
+                r = await client.post(
+                    GROQ_URL,
+                    headers=headers,
+                    json={
+                        "model": "openai/gpt-oss-120b",
+                        "messages": full_msgs,
+                        "reasoning_format": "parsed",
+                        "reasoning_effort": "high",
+                        "temperature": temp,
+                    },
+                )
+                if r.status_code == 200:
+                    msg = first_dict(r.json().get("choices", [])).get("message", {})
+                    return str(msg.get("reasoning") or ""), str(msg.get("content") or "")
+                errors.append(f"Groq oss ({r.status_code}): {r.text[:100]}")
+            except Exception as e:
+                errors.append(f"Groq oss: {e}")
 
-            r2 = await client.post(
-                GROQ_URL,
-                headers=headers,
-                json={"model": "llama-3.3-70b-versatile", "messages": full_msgs, "temperature": temp},
-            )
-            if r2.status_code == 200:
-                msg2 = first_dict(r2.json().get("choices", [])).get("message", {})
-                return "", msg2.get("content", "") or ""
-            errors.append(f"Groq llama ({r2.status_code}): {r2.text[:100]}")
+            try:
+                r2 = await client.post(
+                    GROQ_URL,
+                    headers=headers,
+                    json={"model": "llama-3.3-70b-versatile", "messages": full_msgs, "temperature": temp},
+                )
+                if r2.status_code == 200:
+                    msg2 = first_dict(r2.json().get("choices", [])).get("message", {})
+                    return "", str(msg2.get("content") or "")
+                errors.append(f"Groq llama ({r2.status_code}): {r2.text[:100]}")
+            except Exception as e:
+                errors.append(f"Groq llama: {e}")
 
     if GEMINI_API_KEY:
         user_prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            r = await client.post(
-                f"{GEMINI_CHAT_BASE}?key={GEMINI_API_KEY}",
-                json={"contents": [{"parts": [{"text": user_prompt}]}]},
-            )
-            if r.status_code == 200:
-                cand = first_dict(r.json().get("candidates", []))
-                part = first_dict(cand.get("content", {}).get("parts", []))
-                return "", part.get("text", "")
-            errors.append(f"Gemini ({r.status_code}): {r.text[:100]}")
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                r = await client.post(
+                    f"{GEMINI_CHAT_BASE}?key={GEMINI_API_KEY}",
+                    json={"contents": [{"parts": [{"text": user_prompt}]}]},
+                )
+                if r.status_code == 200:
+                    cand = first_dict(r.json().get("candidates", []))
+                    part = first_dict(cand.get("content", {}).get("parts", []))
+                    return "", str(part.get("text") or "")
+                errors.append(f"Gemini ({r.status_code}): {r.text[:100]}")
+        except Exception as e:
+            errors.append(f"Gemini: {e}")
 
-    return "", f"⚠️ Ошибка провайдеров: {' | '.join(errors) or 'ключи не найдены'}"
+    return "", f"⚠️ Ошибка провайдеров: {' | '.join(errors) or 'ключи не заданы'}"
 
 
 @app.post("/v1/chat/completions")
 @app.post("/chat/completions")
 async def chat(request: Request):
-    body = await request.json()
-    raw_msgs = body.get("messages", [])
-    messages = [{"role": m.get("role", "user"), "content": extract_text(m.get("content", ""))} for m in raw_msgs]
-    last_text = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
-    model_id = body.get("model", "gpt-6-astra")
-    stream = body.get("stream", False)
-    temp = float(body.get("temperature", 0.7))
-
     reasoning = ""
-    if any(w in last_text.lower() for w in ["нарисуй", "сгенерируй картинку", "создай изображение"]):
-        reply = await generate_image_clean(last_text)
-    else:
-        reasoning, reply = await ask_thinking_ai(messages, temp)
+    reply = ""
+    model_id = "gpt-6-astra"
+    stream = False
+
+    try:
+        body = await request.json()
+        raw_msgs = body.get("messages", [])
+        messages = [{"role": m.get("role", "user"), "content": extract_text(m.get("content", ""))} for m in raw_msgs]
+        last_text = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
+        model_id = body.get("model", "gpt-6-astra")
+        stream = bool(body.get("stream", False))
+        temp = float(body.get("temperature", 0.7))
+
+        if any(w in last_text.lower() for w in ["нарисуй", "сгенерируй картинку", "создай изображение"]):
+            reply = await generate_image_clean(last_text)
+        else:
+            reasoning, reply = await ask_thinking_ai(messages, temp)
+    except Exception:
+        reply = f"⚠️ Внутренняя ошибка сервера:\n```\n{traceback.format_exc()[-400:]}\n```"
 
     if not reply:
         reply = "Не удалось получить ответ от нейросети."
@@ -224,32 +251,3 @@ async def chat(request: Request):
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
                 "model": model_id,
-                "choices": [{"index": 0, "delta": {"content": reply}, "finish_reason": None}],
-            }
-            yield f"data: {json.dumps(chunk_c, ensure_ascii=False)}\n\n"
-
-            chunk_end = {
-                "id": "krot-v6",
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": model_id,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            }
-            yield f"data: {json.dumps(chunk_end, ensure_ascii=False)}\n\n"
-            yield "data: [DONE]\n\n"
-
-        return StreamingResponse(sse(), media_type="text/event-stream")
-
-    return {
-        "id": "krot-v6",
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": model_id,
-        "choices": [
-            {
-                "index": 0,
-                "message": {"role": "assistant", "content": reply, "reasoning_content": reasoning},
-                "finish_reason": "stop",
-            }
-        ],
-    }
