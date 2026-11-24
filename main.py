@@ -265,3 +265,7 @@ async def background_video_worker(task_id: str, prompt: str):
         TASKS[task_id]["media_url"] = vid_url
     except Exception as e:
         TASKS[task_id]["status"] = "failed"
+        @app.post("/{full_path:path}/chat/completions")
+async def fallback_chat(full_path: str, req: ChatRequest, request: Request):
+    return await chat_completions(req, request)
+
