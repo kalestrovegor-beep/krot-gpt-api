@@ -13,7 +13,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 
-app = FastAPI(title="KROT GPT Studio API v4.2")
+app = FastAPI(title="KROT GPT Studio API v4.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -49,12 +49,7 @@ class ImageProxyRequest(BaseModel):
 
 @app.get("/")
 async def root():
-    return {
-        "status": "ok",
-        "version": "4.2",
-        "groq_ready": bool(GROQ_API_KEY),
-        "hf_ready": bool(HF_TOKEN),
-    }
+    return {"status": "ok", "version": "4.3", "groq_ready": bool(GROQ_API_KEY), "hf_ready": bool(HF_TOKEN)}
 
 
 @app.get("/v1/models")
@@ -90,7 +85,7 @@ async def translate_to_en(text: str) -> str:
                 json={
                     "model": "llama-3.1-8b-instant",
                     "messages": [
-                        {"role": "system", "content": "Translate to vivid English prompt for AI generation. Return ONLY the English text."},
+                        {"role": "system", "content": "Translate to English prompt for AI generation. Return ONLY English text."},
                         {"role": "user", "content": text},
                     ],
                 },
@@ -112,8 +107,7 @@ def upscale_to_4k_b64(raw_bytes: bytes, make_4k: bool = True) -> str:
             img = img.filter(ImageFilter.UnsharpMask(radius=1.5, percent=120, threshold=3))
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=92)
-    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-    return f"data:image/jpeg;base64,{b64}"
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
 async def generate_flux_image(prompt: str, make_4k: bool = True) -> Optional[str]:
@@ -172,8 +166,7 @@ def run_song_generation_sync(tags: str, lyrics: str) -> str:
         audio_path = audio_path.get("path") or audio_path.get("url")
     if audio_path and os.path.exists(str(audio_path)):
         with open(audio_path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("utf-8")
-        return f"data:audio/mp3;base64,{b64}"
+            return "data:audio/mp3;base64," + base64.b64encode(f.read()).decode("utf-8")
     raise RuntimeError("Аудиофайл не был создан")
 
 
@@ -187,14 +180,7 @@ async def write_song_lyrics(topic: str) -> tuple[str, str]:
             json={
                 "model": "llama-3.3-70b-versatile",
                 "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            "Ты поэт-песенник. Напиши текст песни с тегами [verse], [chorus], [bridge]. "
-                            "В первой строке укажи английские теги стиля: STYLE: pop rock, synth, vocals. "
-                            "Со второй строки пиши только текст песни."
-                        ),
-                    },
+                    {"role": "system", "content": "Напиши текст песни с тегами [verse], [chorus]. В 1-й строке укажи: STYLE: pop, synth, vocals. Со 2-й строки только текст."},
                     {"role": "user", "content": topic},
                 ],
             },
@@ -202,12 +188,9 @@ async def write_song_lyrics(topic: str) -> tuple[str, str]:
         if r.status_code == 200:
             full = r.json()["choices"]["message"]["content"].strip()
             lines = full.splitlines()
-            tags = "pop, synthwave, melodic vocals"
-            lyrics = full
             if lines and lines.upper().startswith("STYLE:"):
-                tags = lines.split(":", 1).strip()
-                lyrics = "\n".join(lines[1:]).strip()
-            return tags, lyrics
+                return lines.split(":", 1).strip(), "\n".join(lines[1:]).strip()
+            return "pop, synthwave, melodic vocals", full
     return "pop, electronic, melodic vocals", topic
 
 
@@ -227,7 +210,7 @@ async def background_song_worker(task_id: str, topic: str):
 def run_video_generation_sync(en_prompt: str) -> str:
     from gradio_client import Client
     spaces = [
-        ("Lightricks/ltx-video-distilled", "/text_to_video", {"prompt": en_prompt, "negative_prompt": "low quality, blurry", "height": 512, "width": 704, "num_frames": 65, "seed": 42}),
+        ("Lightricks/ltx-video-distilled", "/text_to_video", {"prompt": en_prompt, "negative_prompt": "low quality", "height": 512, "width": 704, "num_frames": 65, "seed": 42}),
         ("Wan-AI/Wan2.1", "/t2v_generation_async", {"prompt": en_prompt, "size": "832*480", "watermark_flag": False, "seed": -1}),
     ]
     errors = []
@@ -240,8 +223,7 @@ def run_video_generation_sync(en_prompt: str) -> str:
                 vid_path = vid_path.get("video") or vid_path.get("path") or vid_path.get("url")
             if vid_path and os.path.exists(str(vid_path)):
                 with open(vid_path, "rb") as f:
-                    b64 = base64.b64encode(f.read()).decode("utf-8")
-                return f"data:video/mp4;base64,{b64}"
+                    return "data:video/mp4;base64," + base64.b64encode(f.read()).decode("utf-8")
         except Exception as e:
             errors.append(f"{space_id}: {str(e)}")
     raise RuntimeError(" | ".join(errors))
@@ -271,5 +253,13 @@ def format_task_reply(tid: str) -> str:
     task = TASKS.get(tid)
     if task is None:
         return f"Задача `{tid}` не найдена."
-    if task["status"] == "completed":
-        if task["type"] == "song":
+    status = task.get("status")
+    if status == "completed":
+        media = task.get("media_url", "")
+        if task.get("type") == "song":
+            lyrics = task.get("lyrics", "")
+            return f"🎵 **Песня готова!**\n\n[Скачать или слушать MP3]({media})\n\n**Текст:**\n{lyrics}"
+        return f"🎬 **Видео готово!**\n\n[Открыть или скачать MP4]({media})"
+    if status == "failed":
+        return f"❌ Ошибка генерации: {task.get('error')}"
+    return f"⏳ Задача `{tid}` ещё выполняется (`{status}`). Проверь через 30 секунд: `статус {tid}`"
