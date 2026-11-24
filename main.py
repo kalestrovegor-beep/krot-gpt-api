@@ -9,7 +9,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="KROT GPT Clean API v6.6")
+app = FastAPI(title="KROT GPT Clean API v6.7")
 
 app.add_middleware(
     CORSMiddleware,
@@ -22,15 +22,22 @@ app.add_middleware(
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
-GROQ_URL = "https://" + "/".join(["://groq.com", "openai", "v1", "chat", "completions"])
-GEMINI_CHAT_BASE = "https://" + "/".join(["://googleapis.com", "v1beta", "models", "gemini-2.5-flash:generateContent"])
-GEMINI_IMG_BASE = "https://" + "/".join(["://googleapis.com", "v1beta", "models", "imagen-3.0-generate-002:predict"])
-HORDE_BASE = "https://" + "/".join(["stablehorde.net", "api", "v2", "generate"])
+PROTO = "https" + chr(58) + "//"
+GROQ_URL = PROTO + "/".join(["://groq.com", "openai", "v1", "chat", "completions"])
+GEMINI_CHAT_BASE = PROTO + "/".join(["://googleapis.com", "v1beta", "models", "gemini-2.5-flash:generateContent"])
+GEMINI_IMG_BASE = PROTO + "/".join(["://googleapis.com", "v1beta", "models", "imagen-3.0-generate-002:predict"])
+HORDE_BASE = PROTO + "/".join(["stablehorde.net", "api", "v2", "generate"])
 
 
 @app.get("/")
 async def health():
-    return dict(status="online", version="6.6", groq=bool(GROQ_API_KEY), gemini=bool(GEMINI_API_KEY))
+    return dict(
+        status="online",
+        version="6.7",
+        groq=bool(GROQ_API_KEY),
+        gemini=bool(GEMINI_API_KEY),
+        groq_url=GROQ_URL,
+    )
 
 
 @app.get("/v1/models")
@@ -99,7 +106,7 @@ async def generate_image_clean(prompt: str) -> str:
         except Exception as e:
             errors.append(f"Imagen: {e}")
 
-    headers = {"apikey": "0000000000", "Client-Agent": "KrotGPT:6.6:admin"}
+    headers = {"apikey": "0000000000", "Client-Agent": "KrotGPT:6.7:admin"}
     payload = dict(
         prompt=en_prompt,
         params=dict(width=768, height=768, steps=20, n=1),
