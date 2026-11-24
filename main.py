@@ -13,7 +13,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 
-app = FastAPI(title="KROT GPT Studio API v4.3")
+app = FastAPI(title="KROT GPT Studio API v4.4")
 
 app.add_middleware(
     CORSMiddleware,
@@ -49,7 +49,12 @@ class ImageProxyRequest(BaseModel):
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "version": "4.3", "groq_ready": bool(GROQ_API_KEY), "hf_ready": bool(HF_TOKEN)}
+    return {
+        "status": "ok",
+        "version": "4.4",
+        "groq_ready": bool(GROQ_API_KEY),
+        "hf_ready": bool(HF_TOKEN),
+    }
 
 
 @app.get("/v1/models")
@@ -80,7 +85,7 @@ async def translate_to_en(text: str) -> str:
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             r = await client.post(
-                "https://groq.com" + "/openai/v1/chat/completions",
+                "https://api.groq.com" + "/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
                 json={
                     "model": "llama-3.1-8b-instant",
@@ -91,7 +96,7 @@ async def translate_to_en(text: str) -> str:
                 },
             )
             if r.status_code == 200:
-                return r.json()["choices"]["message"]["content"].strip()
+                return r.json()["choices"][0]["message"]["content"].strip()
     except Exception:
         pass
     return text
@@ -111,21 +116,44 @@ def upscale_to_4k_b64(raw_bytes: bytes, make_4k: bool = True) -> str:
 
 
 async def generate_flux_image(prompt: str, make_4k: bool = True) -> Optional[str]:
-    if not HF_TOKEN:
-        return None
     en_prompt = await translate_to_en(prompt)
-    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-    models = ["black-forest-labs/FLUX.1-dev", "black-forest-labs/FLUX.1-schnell"]
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        for model_id in models:
-            url = "https://huggingface.co" + f"/hf-inference/models/{model_id}"
-            try:
-                r = await client.post(url, headers=headers, json={"inputs": en_prompt})
-                if r.status_code == 200 and "image" in r.headers.get("content-type", ""):
-                    return await asyncio.to_thread(upscale_to_4k_b64, r.content, make_4k)
-            except Exception:
-                continue
-    return None
+    if HF_TOKEN:
+        headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+        models = ["black-forest-labs/FLUX.1-schnell", "black-forest-labs/FLUX.1-dev"]
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            for model_id in models:
+                url = "https://huggingface.co" + f"/hf-inference/models/{model_id}"
+                try:
+                    r = await client.post(url, headers=headers, json={"inputs": en_prompt})
+                    if r.status_code == 200 and "image" in r.headers.get("content-type", ""):
+                        return await asyncio.to_thread(upscale_to_4k_b64, r.content, make_4k)
+                except Exception:
+                    continue
+
+    def _space_fallback():
+        from gradio_client import Client
+        client = Client("black-forest-labs/FLUX.1-schnell", hf_token=HF_TOKEN or None)
+        res = client.predict(
+            prompt=en_prompt,
+            seed=0,
+            randomize_seed=True,
+            width=1024,
+            height=1024,
+            num_inference_steps=4,
+            api_name="/infer",
+        )
+        img_path = res[0] if isinstance(res, (list, tuple)) else res
+        if isinstance(img_path, dict):
+            img_path = img_path.get("path") or img_path.get("url")
+        if img_path and os.path.exists(str(img_path)):
+            with open(img_path, "rb") as f:
+                return upscale_to_4k_b64(f.read(), make_4k)
+        return None
+
+    try:
+        return await asyncio.to_thread(_space_fallback)
+    except Exception:
+        return None
 
 
 @app.post("/v1/image-proxy")
@@ -133,7 +161,7 @@ async def generate_flux_image(prompt: str, make_4k: bool = True) -> Optional[str
 async def image_endpoint(req: ImageProxyRequest):
     img_url = await generate_flux_image(req.prompt, req.upscale_4k)
     if not img_url:
-        raise HTTPException(status_code=502, detail="Проверьте HF_TOKEN в настройках Render.")
+        raise HTTPException(status_code=502, detail="Не удалось создать изображение через FLUX.")
     return {"url": img_url, "data": [{"url": img_url}]}
 
 
@@ -161,7 +189,7 @@ def run_song_generation_sync(tags: str, lyrics: str) -> str:
         guidance_scale_lyric=0.0,
         api_name="/__call__",
     )
-    audio_path = res if isinstance(res, (list, tuple)) else res
+    audio_path = res[0] if isinstance(res, (list, tuple)) else res
     if isinstance(audio_path, dict):
         audio_path = audio_path.get("path") or audio_path.get("url")
     if audio_path and os.path.exists(str(audio_path)):
@@ -175,7 +203,7 @@ async def write_song_lyrics(topic: str) -> tuple[str, str]:
         return "pop, electronic, melodic vocals", f"[verse]\n{topic}\n[chorus]\n{topic}"
     async with httpx.AsyncClient(timeout=25.0) as client:
         r = await client.post(
-            "https://groq.com" + "/openai/v1/chat/completions",
+            "https://api.groq.com" + "/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
             json={
                 "model": "llama-3.3-70b-versatile",
@@ -186,10 +214,10 @@ async def write_song_lyrics(topic: str) -> tuple[str, str]:
             },
         )
         if r.status_code == 200:
-            full = r.json()["choices"]["message"]["content"].strip()
+            full = r.json()["choices"][0]["message"]["content"].strip()
             lines = full.splitlines()
-            if lines and lines.upper().startswith("STYLE:"):
-                return lines.split(":", 1).strip(), "\n".join(lines[1:]).strip()
+            if lines and lines[0].upper().startswith("STYLE:"):
+                return lines[0].split(":", 1)[1].strip(), "\n".join(lines[1:]).strip()
             return "pop, synthwave, melodic vocals", full
     return "pop, electronic, melodic vocals", topic
 
@@ -218,7 +246,7 @@ def run_video_generation_sync(en_prompt: str) -> str:
         try:
             client = Client(space_id, hf_token=HF_TOKEN or None)
             res = client.predict(**kwargs, api_name=api_name)
-            vid_path = res if isinstance(res, (list, tuple)) else res
+            vid_path = res[0] if isinstance(res, (list, tuple)) else res
             if isinstance(vid_path, dict):
                 vid_path = vid_path.get("video") or vid_path.get("path") or vid_path.get("url")
             if vid_path and os.path.exists(str(vid_path)):
@@ -242,24 +270,3 @@ async def background_video_worker(task_id: str, prompt: str):
 
 
 @app.get("/v1/tasks/{task_id}")
-async def get_task_status(task_id: str):
-    task = TASKS.get(task_id)
-    if task is None:
-        raise HTTPException(status_code=404, detail="Задача не найдена")
-    return task
-
-
-def format_task_reply(tid: str) -> str:
-    task = TASKS.get(tid)
-    if task is None:
-        return f"Задача `{tid}` не найдена."
-    status = task.get("status")
-    if status == "completed":
-        media = task.get("media_url", "")
-        if task.get("type") == "song":
-            lyrics = task.get("lyrics", "")
-            return f"🎵 **Песня готова!**\n\n[Скачать или слушать MP3]({media})\n\n**Текст:**\n{lyrics}"
-        return f"🎬 **Видео готово!**\n\n[Открыть или скачать MP4]({media})"
-    if status == "failed":
-        return f"❌ Ошибка генерации: {task.get('error')}"
-    return f"⏳ Задача `{tid}` ещё выполняется (`{status}`). Проверь через 30 секунд: `статус {tid}`"
