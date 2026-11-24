@@ -13,7 +13,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 
-app = FastAPI(title="KROT GPT Studio API v4.1")
+app = FastAPI(title="KROT GPT Studio API v4.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -25,7 +25,6 @@ app.add_middleware(
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
-
 TASKS: Dict[str, Dict[str, Any]] = {}
 
 
@@ -52,7 +51,7 @@ class ImageProxyRequest(BaseModel):
 async def root():
     return {
         "status": "ok",
-        "version": "4.1 (Groq + HF FLUX 4K + ACE-Step Song + Video)",
+        "version": "4.2",
         "groq_ready": bool(GROQ_API_KEY),
         "hf_ready": bool(HF_TOKEN),
     }
@@ -97,7 +96,7 @@ async def translate_to_en(text: str) -> str:
                 },
             )
             if r.status_code == 200:
-                return r.json()["choices"][0]["message"]["content"].strip()
+                return r.json()["choices"]["message"]["content"].strip()
     except Exception:
         pass
     return text
@@ -122,10 +121,7 @@ async def generate_flux_image(prompt: str, make_4k: bool = True) -> Optional[str
         return None
     en_prompt = await translate_to_en(prompt)
     headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-    models = [
-        "black-forest-labs/FLUX.1-dev",
-        "black-forest-labs/FLUX.1-schnell",
-    ]
+    models = ["black-forest-labs/FLUX.1-dev", "black-forest-labs/FLUX.1-schnell"]
     async with httpx.AsyncClient(timeout=60.0) as client:
         for model_id in models:
             url = "https://huggingface.co" + f"/hf-inference/models/{model_id}"
@@ -143,15 +139,15 @@ async def generate_flux_image(prompt: str, make_4k: bool = True) -> Optional[str
 async def image_endpoint(req: ImageProxyRequest):
     img_url = await generate_flux_image(req.prompt, req.upscale_4k)
     if not img_url:
-        raise HTTPException(status_code=502, detail="Проверьте HF_TOKEN в настройках Render или лимиты Hugging Face.")
+        raise HTTPException(status_code=502, detail="Проверьте HF_TOKEN в настройках Render.")
     return {"url": img_url, "data": [{"url": img_url}]}
 
 
-def run_song_generation_sync(tags: str, lyrics: str, duration: int = 90) -> str:
+def run_song_generation_sync(tags: str, lyrics: str) -> str:
     from gradio_client import Client
     client = Client("ACE-Step/ACE-Step", hf_token=HF_TOKEN or None)
     res = client.predict(
-        audio_duration=duration,
+        audio_duration=90,
         prompt=tags,
         lyrics=lyrics,
         infer_step=40,
@@ -171,7 +167,7 @@ def run_song_generation_sync(tags: str, lyrics: str, duration: int = 90) -> str:
         guidance_scale_lyric=0.0,
         api_name="/__call__",
     )
-    audio_path = res[0] if isinstance(res, (list, tuple)) else res
+    audio_path = res if isinstance(res, (list, tuple)) else res
     if isinstance(audio_path, dict):
         audio_path = audio_path.get("path") or audio_path.get("url")
     if audio_path and os.path.exists(str(audio_path)):
@@ -183,7 +179,7 @@ def run_song_generation_sync(tags: str, lyrics: str, duration: int = 90) -> str:
 
 async def write_song_lyrics(topic: str) -> tuple[str, str]:
     if not GROQ_API_KEY:
-        return "pop, electronic, energetic, male vocals", f"[verse]\n{topic}\n[chorus]\n{topic}"
+        return "pop, electronic, melodic vocals", f"[verse]\n{topic}\n[chorus]\n{topic}"
     async with httpx.AsyncClient(timeout=25.0) as client:
         r = await client.post(
             "https://groq.com" + "/openai/v1/chat/completions",
@@ -194,9 +190,9 @@ async def write_song_lyrics(topic: str) -> tuple[str, str]:
                     {
                         "role": "system",
                         "content": (
-                            "Ты композитор и поэт-песенник. По запросу пользователя напиши текст песни с тегами [verse], [chorus], [bridge] "
-                            "и в первой строке укажи английские теги стиля (например: STYLE: pop rock, synth, emotional vocals, 120 bpm). "
-                            "Начиная со второй строки пиши только текст песни."
+                            "Ты поэт-песенник. Напиши текст песни с тегами [verse], [chorus], [bridge]. "
+                            "В первой строке укажи английские теги стиля: STYLE: pop rock, synth, vocals. "
+                            "Со второй строки пиши только текст песни."
                         ),
                     },
                     {"role": "user", "content": topic},
@@ -204,12 +200,12 @@ async def write_song_lyrics(topic: str) -> tuple[str, str]:
             },
         )
         if r.status_code == 200:
-            full = r.json()["choices"][0]["message"]["content"].strip()
+            full = r.json()["choices"]["message"]["content"].strip()
             lines = full.splitlines()
             tags = "pop, synthwave, melodic vocals"
             lyrics = full
-            if lines and lines[0].upper().startswith("STYLE:"):
-                tags = lines[0].split(":", 1)[1].strip()
+            if lines and lines.upper().startswith("STYLE:"):
+                tags = lines.split(":", 1).strip()
                 lyrics = "\n".join(lines[1:]).strip()
             return tags, lyrics
     return "pop, electronic, melodic vocals", topic
@@ -220,7 +216,7 @@ async def background_song_worker(task_id: str, topic: str):
     try:
         tags, lyrics = await write_song_lyrics(topic)
         TASKS[task_id]["lyrics"] = lyrics
-        audio_url = await asyncio.to_thread(run_song_generation_sync, tags, lyrics, 90)
+        audio_url = await asyncio.to_thread(run_song_generation_sync, tags, lyrics)
         TASKS[task_id]["status"] = "completed"
         TASKS[task_id]["media_url"] = audio_url
     except Exception as e:
@@ -239,7 +235,7 @@ def run_video_generation_sync(en_prompt: str) -> str:
         try:
             client = Client(space_id, hf_token=HF_TOKEN or None)
             res = client.predict(**kwargs, api_name=api_name)
-            vid_path = res[0] if isinstance(res, (list, tuple)) else res
+            vid_path = res if isinstance(res, (list, tuple)) else res
             if isinstance(vid_path, dict):
                 vid_path = vid_path.get("video") or vid_path.get("path") or vid_path.get("url")
             if vid_path and os.path.exists(str(vid_path)):
@@ -266,4 +262,14 @@ async def background_video_worker(task_id: str, prompt: str):
 @app.get("/v1/tasks/{task_id}")
 async def get_task_status(task_id: str):
     task = TASKS.get(task_id)
-    if not task:
+    if task is None:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    return task
+
+
+def format_task_reply(tid: str) -> str:
+    task = TASKS.get(tid)
+    if task is None:
+        return f"Задача `{tid}` не найдена."
+    if task["status"] == "completed":
+        if task["type"] == "song":
