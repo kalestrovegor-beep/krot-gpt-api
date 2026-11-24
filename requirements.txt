@@ -1,5 +1,3 @@
 fastapi
 uvicorn
 httpx
-gradio_client
-Pillow
