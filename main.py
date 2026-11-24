@@ -9,7 +9,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="KROT GPT Clean API v6.5")
+app = FastAPI(title="KROT GPT Clean API v6.6")
 
 app.add_middleware(
     CORSMiddleware,
@@ -22,15 +22,15 @@ app.add_middleware(
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
-GROQ_URL = "/".join(["https:/", "://groq.com", "openai", "v1", "chat", "completions"])
-GEMINI_CHAT_BASE = "/".join(["https:/", "://googleapis.com", "v1beta", "models", "gemini-2.5-flash:generateContent"])
-GEMINI_IMG_BASE = "/".join(["https:/", "://googleapis.com", "v1beta", "models", "imagen-3.0-generate-002:predict"])
-HORDE_BASE = "/".join(["https:/", "stablehorde.net", "api", "v2", "generate"])
+GROQ_URL = "https://" + "/".join(["://groq.com", "openai", "v1", "chat", "completions"])
+GEMINI_CHAT_BASE = "https://" + "/".join(["://googleapis.com", "v1beta", "models", "gemini-2.5-flash:generateContent"])
+GEMINI_IMG_BASE = "https://" + "/".join(["://googleapis.com", "v1beta", "models", "imagen-3.0-generate-002:predict"])
+HORDE_BASE = "https://" + "/".join(["stablehorde.net", "api", "v2", "generate"])
 
 
 @app.get("/")
 async def health():
-    return dict(status="online", version="6.5", groq=bool(GROQ_API_KEY), gemini=bool(GEMINI_API_KEY))
+    return dict(status="online", version="6.6", groq=bool(GROQ_API_KEY), gemini=bool(GEMINI_API_KEY))
 
 
 @app.get("/v1/models")
@@ -99,11 +99,11 @@ async def generate_image_clean(prompt: str) -> str:
         except Exception as e:
             errors.append(f"Imagen: {e}")
 
-    headers = {"apikey": "0000000000", "Client-Agent": "KrotGPT:6.5:admin"}
+    headers = {"apikey": "0000000000", "Client-Agent": "KrotGPT:6.6:admin"}
     payload = dict(
         prompt=en_prompt,
-        params=dict(width=1024, height=1024, steps=4, n=1),
-        models=["Flux.1-Schnell fp8", "AlbedoBase XL (SDXL)"],
+        params=dict(width=768, height=768, steps=20, n=1),
+        models=["AlbedoBase XL (SDXL)", "Juggernaut XL", "Flux.1-Schnell fp8"],
     )
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -111,7 +111,7 @@ async def generate_image_clean(prompt: str) -> str:
             if r.status_code == 202:
                 gen_id = r.json().get("id")
                 for _ in range(25):
-                    await asyncio.sleep(2.5)
+                    await asyncio.sleep(2.0)
                     chk = await client.get(f"{HORDE_BASE}/check/{gen_id}", headers=headers)
                     if chk.status_code == 200 and chk.json().get("done"):
                         st = await client.get(f"{HORDE_BASE}/status/{gen_id}", headers=headers)
@@ -120,9 +120,9 @@ async def generate_image_clean(prompt: str) -> str:
                         if img_val.startswith("http"):
                             img_r = await client.get(img_val)
                             b64 = base64.b64encode(img_r.content).decode("utf-8")
-                            return f"![FLUX](data:image/webp;base64,{b64})"
+                            return f"![Изображение](data:image/webp;base64,{b64})"
                         elif img_val:
-                            return f"![FLUX](data:image/webp;base64,{img_val})"
+                            return f"![Изображение](data:image/webp;base64,{img_val})"
                 errors.append("AI Horde: очередь перегружена")
             else:
                 errors.append(f"AI Horde ({r.status_code})")
