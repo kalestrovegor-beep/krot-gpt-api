@@ -6,7 +6,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 
-app = FastAPI(title="KROT GPT Studio API v4.7")
+app = FastAPI(title="KROT GPT Studio API v4.8")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
@@ -34,7 +34,7 @@ class ImageProxyRequest(BaseModel):
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "version": "4.7", "groq": bool(GROQ_API_KEY), "hf": bool(HF_TOKEN)}
+    return {"status": "ok", "version": "4.8", "groq": bool(GROQ_API_KEY), "hf": bool(HF_TOKEN)}
 
 @app.get("/v1/models")
 @app.get("/models")
@@ -197,15 +197,17 @@ async def ask_groq(msgs: List[Dict[str, str]], temp: float) -> tuple[str, str]:
             return "", m2.get("content", "") or "Пустой ответ от модели"
         return "", f"Ошибка Groq ({r.status_code}): {r.text}"
 
-@app.post("/v1/chat/completions")
-@app.post("/chat/completions")
-async def chat_ep(req: ChatRequest):
-    msgs = [{"role": m.role, "content": extract_text(m.content)} for m in req.messages]
-    last = next((m["content"] for m in reversed(msgs) if m["role"] == "user"), "")
-    low, reply, reason = last.lower(), "", ""
+def check_task(tid: str) -> str:
+    t = TASKS.get(tid)
+    if not t:
+        return "Задача не найдена."
+    st = t.get("status")
+    if st == "failed":
+        return f"❌ Ошибка: {t.get('error')}"
+    if st != "completed":
+        return f"⏳ В процессе (`{st}`). Проверь через 30 сек."
+    media = t.get("media", "")
+    if t.get("type") == "song":
+        return f"🎵 **Готово!** [Открыть / скачать MP3]({media})\n\n{t.get('lyrics', '')}"
+    return f"🎬 **Готово!** [Открыть / скачать MP4]({media})"
 
-    if "статус" in low:
-        t = TASKS.get(last.replace("/", " ").split()[-1])
-        if not t:
-            reply = "Задача не найдена."
-        elif t["status"] == "completed":
