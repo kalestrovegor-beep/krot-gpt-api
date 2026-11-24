@@ -13,7 +13,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 
-app = FastAPI(title="KROT GPT Studio API v4.0")
+app = FastAPI(title="KROT GPT Studio API v4.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -52,7 +52,7 @@ class ImageProxyRequest(BaseModel):
 async def root():
     return {
         "status": "ok",
-        "version": "4.0 (Groq + HF FLUX 4K + ACE-Step Song + Video)",
+        "version": "4.1 (Groq + HF FLUX 4K + ACE-Step Song + Video)",
         "groq_ready": bool(GROQ_API_KEY),
         "hf_ready": bool(HF_TOKEN),
     }
@@ -80,7 +80,6 @@ def extract_text(content: Any) -> str:
     return str(content)
 
 
-# --- 1. УМНЫЙ ПЕРЕВОД ПРОМПТА ЧЕРЕЗ GROQ (БЕЗ POLLINATIONS) ---
 async def translate_to_en(text: str) -> str:
     if not any("а" <= c.lower() <= "я" for c in text) or not GROQ_API_KEY:
         return text
@@ -98,18 +97,16 @@ async def translate_to_en(text: str) -> str:
                 },
             )
             if r.status_code == 200:
-                return r.json()["choices"]["message"]["content"].strip()
+                return r.json()["choices"][0]["message"]["content"].strip()
     except Exception:
         pass
     return text
 
 
-# --- 2. КАРТИНКИ FLUX (HUGGING FACE) + АПСКЕЙЛ ДО 4K ---
 def upscale_to_4k_b64(raw_bytes: bytes, make_4k: bool = True) -> str:
     img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
     if make_4k:
         w, h = img.size
-        # Увеличиваем до 4K по длинной стороне с сохранением пропорций и повышением резкости
         scale = 3840 / max(w, h)
         if scale > 1:
             img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
@@ -150,7 +147,6 @@ async def image_endpoint(req: ImageProxyRequest):
     return {"url": img_url, "data": [{"url": img_url}]}
 
 
-# --- 3. ГЕНЕРАЦИЯ ПЕСЕН С ВОКАЛОМ (ACE-STEP НА HUGGING FACE) ---
 def run_song_generation_sync(tags: str, lyrics: str, duration: int = 90) -> str:
     from gradio_client import Client
     client = Client("ACE-Step/ACE-Step", hf_token=HF_TOKEN or None)
@@ -175,7 +171,7 @@ def run_song_generation_sync(tags: str, lyrics: str, duration: int = 90) -> str:
         guidance_scale_lyric=0.0,
         api_name="/__call__",
     )
-    audio_path = res if isinstance(res, (list, tuple)) else res
+    audio_path = res[0] if isinstance(res, (list, tuple)) else res
     if isinstance(audio_path, dict):
         audio_path = audio_path.get("path") or audio_path.get("url")
     if audio_path and os.path.exists(str(audio_path)):
@@ -208,12 +204,12 @@ async def write_song_lyrics(topic: str) -> tuple[str, str]:
             },
         )
         if r.status_code == 200:
-            full = r.json()["choices"]["message"]["content"].strip()
+            full = r.json()["choices"][0]["message"]["content"].strip()
             lines = full.splitlines()
             tags = "pop, synthwave, melodic vocals"
             lyrics = full
-            if lines and lines.upper().startswith("STYLE:"):
-                tags = lines.split(":", 1).strip()
+            if lines and lines[0].upper().startswith("STYLE:"):
+                tags = lines[0].split(":", 1)[1].strip()
                 lyrics = "\n".join(lines[1:]).strip()
             return tags, lyrics
     return "pop, electronic, melodic vocals", topic
@@ -232,7 +228,6 @@ async def background_song_worker(task_id: str, topic: str):
         TASKS[task_id]["error"] = str(e)
 
 
-# --- 4. ГЕНЕРАЦИЯ ВИДЕОКЛИПОВ (LTX-VIDEO / WAN2.1) ---
 def run_video_generation_sync(en_prompt: str) -> str:
     from gradio_client import Client
     spaces = [
@@ -244,7 +239,7 @@ def run_video_generation_sync(en_prompt: str) -> str:
         try:
             client = Client(space_id, hf_token=HF_TOKEN or None)
             res = client.predict(**kwargs, api_name=api_name)
-            vid_path = res if isinstance(res, (list, tuple)) else res
+            vid_path = res[0] if isinstance(res, (list, tuple)) else res
             if isinstance(vid_path, dict):
                 vid_path = vid_path.get("video") or vid_path.get("path") or vid_path.get("url")
             if vid_path and os.path.exists(str(vid_path)):
@@ -265,7 +260,10 @@ async def background_video_worker(task_id: str, prompt: str):
         TASKS[task_id]["media_url"] = vid_url
     except Exception as e:
         TASKS[task_id]["status"] = "failed"
-        @app.post("/{full_path:path}/chat/completions")
-async def fallback_chat(full_path: str, req: ChatRequest, request: Request):
-    return await chat_completions(req, request)
+        TASKS[task_id]["error"] = str(e)
 
+
+@app.get("/v1/tasks/{task_id}")
+async def get_task_status(task_id: str):
+    task = TASKS.get(task_id)
+    if not task:
