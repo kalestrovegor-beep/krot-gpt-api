@@ -7,7 +7,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="KROT GPT HACKER Clean API v6.2")
+app = FastAPI(title="KROT GPT Clean API v6.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,9 +21,8 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 
-# Собираем URL через join, чтобы фильтр при копировании ничего не обрезал
 GROQ_URL = "/".join(["https:/", "://groq.com", "openai", "v1", "chat", "completions"])
-HF_FLUX_URL = "/".join(["https:/", "router.huggingface.co", "hf-inference", "models", "black-forest-labs", "FLUX.1-schnell"])
+HF_BASE = "/".join(["https:/", "router.huggingface.co", "hf-inference", "models"])
 GEMINI_CHAT_BASE = "/".join(["https:/", "://googleapis.com", "v1beta", "models", "gemini-2.5-flash:generateContent"])
 GEMINI_IMG_BASE = "/".join(["https:/", "://googleapis.com", "v1beta", "models", "imagen-3.0-generate-002:predict"])
 
@@ -32,9 +31,7 @@ GEMINI_IMG_BASE = "/".join(["https:/", "://googleapis.com", "v1beta", "models", 
 async def health():
     return {
         "status": "online",
-        "version": "6.2-clean",
-        "groq_url": GROQ_URL,
-        "hf_url": HF_FLUX_URL,
+        "version": "6.3-clean",
         "groq": bool(GROQ_API_KEY),
         "gemini": bool(GEMINI_API_KEY),
         "hf": bool(HF_TOKEN),
@@ -61,24 +58,51 @@ def extract_text(content):
     return str(content)
 
 
-def get_first(lst):
-    if isinstance(lst, list) and len(lst) > 0:
-        return lst
+def first_dict(lst):
+    if isinstance(lst, list):
+        for item in lst:
+            if isinstance(item, dict):
+                return item
     return {}
+
+
+async def translate_prompt(text: str) -> str:
+    if not any("а" <= c.lower() <= "я" for c in text) or not GROQ_API_KEY:
+        return text
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.post(
+                GROQ_URL,
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                json={
+                    "model": "llama-3.1-8b-instant",
+                    "messages": [
+                        {"role": "system", "content": "Translate to vivid English image prompt. Output ONLY English text."},
+                        {"role": "user", "content": text},
+                    ],
+                },
+            )
+            if r.status_code == 200:
+                choice = first_dict(r.json().get("choices", []))
+                return choice.get("message", {}).get("content", text).strip()
+    except Exception:
+        pass
+    return text
 
 
 async def generate_image_clean(prompt: str) -> str:
     errors = []
+    en_prompt = await translate_prompt(prompt)
 
     if GEMINI_API_KEY:
         try:
             async with httpx.AsyncClient(timeout=45.0) as client:
                 r = await client.post(
                     f"{GEMINI_IMG_BASE}?key={GEMINI_API_KEY}",
-                    json={"instances": [{"prompt": prompt}], "parameters": {"sampleCount": 1}},
+                    json={"instances": [{"prompt": en_prompt}], "parameters": {"sampleCount": 1}},
                 )
                 if r.status_code == 200:
-                    pred = get_first(r.json().get("predictions", []))
+                    pred = first_dict(r.json().get("predictions", []))
                     b64 = pred.get("bytesBase64Encoded")
                     if b64:
                         return f"![Изображение](data:image/png;base64,{b64})"
@@ -87,19 +111,25 @@ async def generate_image_clean(prompt: str) -> str:
             errors.append(f"Gemini Imagen: {e}")
 
     if HF_TOKEN:
-        try:
-            async with httpx.AsyncClient(timeout=45.0) as client:
-                r = await client.post(
-                    HF_FLUX_URL,
-                    headers={"Authorization": f"Bearer {HF_TOKEN}"},
-                    json={"inputs": prompt},
-                )
-                if r.status_code == 200 and "image" in r.headers.get("content-type", ""):
-                    b64 = base64.b64encode(r.content).decode("utf-8")
-                    return f"![FLUX](data:image/jpeg;base64,{b64})"
-                errors.append(f"HF FLUX ({r.status_code}): {r.text[:120]}")
-        except Exception as e:
-            errors.append(f"HF FLUX: {e}")
+        hf_models = [
+            "black-forest-labs/FLUX.1-dev",
+            "stabilityai/stable-diffusion-xl-base-1.0",
+            "ByteDance/SDXL-Lightning",
+        ]
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            for m in hf_models:
+                try:
+                    r = await client.post(
+                        f"{HF_BASE}/{m}",
+                        headers={"Authorization": f"Bearer {HF_TOKEN}"},
+                        json={"inputs": en_prompt},
+                    )
+                    if r.status_code == 200 and "image" in r.headers.get("content-type", ""):
+                        b64 = base64.b64encode(r.content).decode("utf-8")
+                        return f"![Изображение](data:image/jpeg;base64,{b64})"
+                    errors.append(f"{m} ({r.status_code}): {r.text[:80]}")
+                except Exception as e:
+                    errors.append(f"{m}: {e}")
 
     return f"❌ Не удалось создать картинку: {' | '.join(errors) or 'ключи не заданы'}"
 
@@ -127,9 +157,9 @@ async def ask_thinking_ai(messages: list, temp: float) -> tuple[str, str]:
                 },
             )
             if r.status_code == 200:
-                msg = get_first(r.json().get("choices", [])).get("message", {})
+                msg = first_dict(r.json().get("choices", [])).get("message", {})
                 return msg.get("reasoning", "") or "", msg.get("content", "") or ""
-            errors.append(f"Groq gpt-oss ({r.status_code}): {r.text[:120]}")
+            errors.append(f"Groq gpt-oss ({r.status_code}): {r.text[:100]}")
 
             r2 = await client.post(
                 GROQ_URL,
@@ -137,9 +167,9 @@ async def ask_thinking_ai(messages: list, temp: float) -> tuple[str, str]:
                 json={"model": "llama-3.3-70b-versatile", "messages": full_msgs, "temperature": temp},
             )
             if r2.status_code == 200:
-                msg2 = get_first(r2.json().get("choices", [])).get("message", {})
+                msg2 = first_dict(r2.json().get("choices", [])).get("message", {})
                 return "", msg2.get("content", "") or ""
-            errors.append(f"Groq llama ({r2.status_code}): {r2.text[:120]}")
+            errors.append(f"Groq llama ({r2.status_code}): {r2.text[:100]}")
 
     if GEMINI_API_KEY:
         user_prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
@@ -149,10 +179,10 @@ async def ask_thinking_ai(messages: list, temp: float) -> tuple[str, str]:
                 json={"contents": [{"parts": [{"text": user_prompt}]}]},
             )
             if r.status_code == 200:
-                cand = get_first(r.json().get("candidates", []))
-                part = get_first(cand.get("content", {}).get("parts", []))
+                cand = first_dict(r.json().get("candidates", []))
+                part = first_dict(cand.get("content", {}).get("parts", []))
                 return "", part.get("text", "")
-            errors.append(f"Gemini ({r.status_code}): {r.text[:120]}")
+            errors.append(f"Gemini ({r.status_code}): {r.text[:100]}")
 
     return "", f"⚠️ Ошибка провайдеров: {' | '.join(errors) or 'ключи не найдены'}"
 
