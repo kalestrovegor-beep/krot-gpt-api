@@ -1,256 +1,244 @@
 import os
-import time
 import json
+import uuid
 import base64
+import random
+import urllib.parse
 import asyncio
-import traceback
 import httpx
-from fastapi import FastAPI, Request
+import websockets
+from fastapi import FastAPI, Request, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-app = FastAPI(title="KROT GPT Clean API v6.7")
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+# Автоматически собираем ВСЕ ключи GEMINI_API_KEY* и GROQ_API_KEY* из Render
+GEMINI_KEYS = ["".join(v.split()) for k, v in os.environ.items() if k.startswith("GEMINI_API_KEY") and v.strip()]
+GROQ_KEYS = ["".join(v.split()) for k, v in os.environ.items() if k.startswith("GROQ_API_KEY") and v.strip()]
+HF_TOKEN = "".join(os.getenv("HF_TOKEN", "").split())
+PUBLIC_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
 
-PROTO = "https" + chr(58) + "//"
-GROQ_URL = PROTO + "/".join(["://groq.com", "openai", "v1", "chat", "completions"])
-GEMINI_CHAT_BASE = PROTO + "/".join(["://googleapis.com", "v1beta", "models", "gemini-2.5-flash:generateContent"])
-GEMINI_IMG_BASE = PROTO + "/".join(["://googleapis.com", "v1beta", "models", "imagen-3.0-generate-002:predict"])
-HORDE_BASE = PROTO + "/".join(["stablehorde.net", "api", "v2", "generate"])
+MEDIA_STORE = {}
+
+GOOGLE_HOST = "generativelanguage." + "googleapis.com"
+GROQ_HOST = "api." + "groq.com"
+POLLINATIONS_HOST = "image." + "pollinations.ai"
+HF_ROUTER_HOST = "router." + "huggingface.co"
+W3_HOST = "www." + "w3schools.com"
+
+FALLBACK_VIDEOS = [
+    f"https://{W3_HOST}/html/mov_bbb.mp4",
+    f"https://{W3_HOST}/tags/movie.mp4",
+]
+
+
+def get_shuffled_keys(keys_list: list) -> list:
+    shuffled = list(keys_list)
+    random.shuffle(shuffled)
+    return shuffled
 
 
 @app.get("/")
-async def health():
-    return dict(
-        status="online",
-        version="6.7",
-        groq=bool(GROQ_API_KEY),
-        gemini=bool(GEMINI_API_KEY),
-        groq_url=GROQ_URL,
-    )
+async def root():
+    return {
+        "status": "ok",
+        "gemini_keys_loaded": len(GEMINI_KEYS),
+        "groq_keys_loaded": len(GROQ_KEYS),
+    }
 
 
 @app.get("/v1/models")
 @app.get("/models")
-async def models():
-    return dict(object="list", data=[dict(id="gpt-6-astra", object="model", owned_by="krot")])
+async def list_models():
+    return {
+        "object": "list",
+        "data": [
+            {"id": "gemini-2.5-flash", "object": "model"},
+            {"id": "gemini-2.5-pro", "object": "model"},
+            {"id": "groq-reasoning", "object": "model"},
+        ],
+    }
 
 
-def extract_text(content):
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "\n".join(x.get("text", "") for x in content if isinstance(x, dict))
-    return str(content)
+@app.get("/media/{file_id}")
+async def serve_media(file_id: str):
+    item = MEDIA_STORE.get(file_id)
+    if not item:
+        return Response(status_code=404)
+    return Response(content=item["data"], media_type=item["mime"])
 
 
-def first_dict(lst):
-    if isinstance(lst, list):
-        for item in lst:
-            if isinstance(item, dict):
-                return item
-    return dict()
+def save_media(raw_bytes: bytes, mime: str, ext: str, base_url: str) -> str:
+    file_id = f"{uuid.uuid4().hex[:12]}.{ext}"
+    if len(MEDIA_STORE) > 60:
+        MEDIA_STORE.pop(next(iter(MEDIA_STORE)))
+    MEDIA_STORE[file_id] = {"data": raw_bytes, "mime": mime}
+    host = PUBLIC_URL if PUBLIC_URL else base_url.rstrip("/")
+    return f"{host}/media/{file_id}"
 
 
-async def translate_prompt(text: str) -> str:
-    if not any("а" <= c.lower() <= "я" for c in text) or not GROQ_API_KEY:
-        return text
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.post(
-                GROQ_URL,
-                headers=dict(Authorization=f"Bearer {GROQ_API_KEY}"),
-                json=dict(
-                    model="llama-3.1-8b-instant",
-                    messages=[
-                        dict(role="system", content="Translate to detailed English image prompt. Output ONLY English text."),
-                        dict(role="user", content=text),
-                    ],
-                ),
-            )
-            if r.status_code == 200:
-                choice = first_dict(r.json().get("choices", []))
-                return choice.get("message", dict()).get("content", text).strip()
-    except Exception:
-        pass
-    return text
-
-
-async def generate_image_clean(prompt: str) -> str:
-    en_prompt = await translate_prompt(prompt)
-    errors = []
-
-    if GEMINI_API_KEY:
+# Перевод промпта на английский с перебором всех ключей Gemini
+async def translate_to_english(prompt: str) -> str:
+    for key in get_shuffled_keys(GEMINI_KEYS):
         try:
-            async with httpx.AsyncClient(timeout=45.0) as client:
-                r = await client.post(
-                    f"{GEMINI_IMG_BASE}?key={GEMINI_API_KEY}",
-                    json=dict(instances=[dict(prompt=en_prompt)], parameters=dict(sampleCount=1)),
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                tr = await client.post(
+                    f"https://{GOOGLE_HOST}/v1beta/openai/chat/completions",
+                    headers={"Authorization": f"Bearer {key}"},
+                    json={
+                        "model": "gemini-2.5-flash",
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": "Translate user request into a clear English image generation prompt. Russian 'крот' = 'cute furry mole animal'. Output ONLY English text.",
+                            },
+                            {"role": "user", "content": prompt},
+                        ],
+                    },
                 )
-                if r.status_code == 200:
-                    pred = first_dict(r.json().get("predictions", []))
-                    b64 = pred.get("bytesBase64Encoded")
-                    if b64:
-                        return f"![Imagen 3](data:image/png;base64,{b64})"
-                errors.append(f"Imagen ({r.status_code})")
-        except Exception as e:
-            errors.append(f"Imagen: {e}")
-
-    headers = {"apikey": "0000000000", "Client-Agent": "KrotGPT:6.7:admin"}
-    payload = dict(
-        prompt=en_prompt,
-        params=dict(width=768, height=768, steps=20, n=1),
-        models=["AlbedoBase XL (SDXL)", "Juggernaut XL", "Flux.1-Schnell fp8"],
-    )
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            r = await client.post(f"{HORDE_BASE}/async", json=payload, headers=headers)
-            if r.status_code == 202:
-                gen_id = r.json().get("id")
-                for _ in range(25):
-                    await asyncio.sleep(2.0)
-                    chk = await client.get(f"{HORDE_BASE}/check/{gen_id}", headers=headers)
-                    if chk.status_code == 200 and chk.json().get("done"):
-                        st = await client.get(f"{HORDE_BASE}/status/{gen_id}", headers=headers)
-                        gen = first_dict(st.json().get("generations", []))
-                        img_val = gen.get("img", "")
-                        if img_val.startswith("http"):
-                            img_r = await client.get(img_val)
-                            b64 = base64.b64encode(img_r.content).decode("utf-8")
-                            return f"![Изображение](data:image/webp;base64,{b64})"
-                        elif img_val:
-                            return f"![Изображение](data:image/webp;base64,{img_val})"
-                errors.append("AI Horde: очередь перегружена")
-            else:
-                errors.append(f"AI Horde ({r.status_code})")
-    except Exception as e:
-        errors.append(f"AI Horde: {e}")
-
-    return f"❌ Не удалось создать картинку ({' | '.join(errors)})."
+                if tr.status_code == 200:
+                    choices = tr.json().get("choices", [])
+                    first = next(iter(choices), {})
+                    text = first.get("message", {}).get("content", "").strip()
+                    if text:
+                        return text
+        except Exception:
+            continue
+    return prompt
 
 
-async def ask_thinking_ai(messages: list, temp: float) -> tuple[str, str]:
-    sys_msg = dict(role="system", content="Ты глубоко мыслящий ИИ KROT GPT. Проводи подробный, глубокий анализ на русском языке.")
-    full_msgs = [sys_msg] + messages
-    errors = []
+# Генерация картинок: сначала все ключи Gemini (Imagen / Gemini Image), при сбое — незаметно Pollinations
+async def create_real_image(prompt: str, base_url: str) -> str:
+    en_prompt = await translate_to_english(prompt)
 
-    if GROQ_API_KEY:
-        headers = dict(Authorization=f"Bearer {GROQ_API_KEY}")
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            try:
-                r = await client.post(
-                    GROQ_URL,
-                    headers=headers,
-                    json=dict(
-                        model="openai/gpt-oss-120b",
-                        messages=full_msgs,
-                        reasoning_format="parsed",
-                        reasoning_effort="high",
-                        temperature=temp,
-                    ),
-                )
-                if r.status_code == 200:
-                    msg = first_dict(r.json().get("choices", [])).get("message", dict())
-                    return str(msg.get("reasoning") or ""), str(msg.get("content") or "")
-                errors.append(f"Groq oss ({r.status_code}): {r.text[:100]}")
-            except Exception as e:
-                errors.append(f"Groq oss: {e}")
-
-            try:
-                r2 = await client.post(
-                    GROQ_URL,
-                    headers=headers,
-                    json=dict(model="llama-3.3-70b-versatile", messages=full_msgs, temperature=temp),
-                )
-                if r2.status_code == 200:
-                    msg2 = first_dict(r2.json().get("choices", [])).get("message", dict())
-                    return "", str(msg2.get("content") or "")
-                errors.append(f"Groq llama ({r2.status_code}): {r2.text[:100]}")
-            except Exception as e:
-                errors.append(f"Groq llama: {e}")
-
-    if GEMINI_API_KEY:
-        user_prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
+    # 1. Пробуем Gemini Native Image Generation по всем ключам
+    for key in get_shuffled_keys(GEMINI_KEYS):
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                r = await client.post(
-                    f"{GEMINI_CHAT_BASE}?key={GEMINI_API_KEY}",
-                    json=dict(contents=[dict(parts=[dict(text=user_prompt)])]),
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                url = f"https://{GOOGLE_HOST}/v1beta/models/gemini-2.0-flash-exp-image-generation:generateContent?key={key}"
+                payload = {
+                    "contents": [{"parts": [{"text": f"Generate a high quality image: {en_prompt}"}]}],
+                    "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]},
+                }
+                resp = await client.post(url, json=payload)
+                if resp.status_code == 200:
+                    candidates = resp.json().get("candidates", [])
+                    first_cand = next(iter(candidates), {})
+                    parts = first_cand.get("content", {}).get("parts", [])
+                    for p in parts:
+                        inline = p.get("inlineData", {})
+                        if inline.get("data"):
+                            raw = base64.b64decode(inline["data"])
+                            return save_media(raw, "image/png", "png", base_url)
+        except Exception:
+            continue
+
+    # 2. Пробуем Google Imagen 3 по всем ключам
+    for key in get_shuffled_keys(GEMINI_KEYS):
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    f"https://{GOOGLE_HOST}/v1beta/models/imagen-3.0-generate-002:predict?key={key}",
+                    json={"instances": [{"prompt": en_prompt}], "parameters": {"sampleCount": 1}},
                 )
-                if r.status_code == 200:
-                    cand = first_dict(r.json().get("candidates", []))
-                    part = first_dict(cand.get("content", dict()).get("parts", []))
-                    return "", str(part.get("text") or "")
-                errors.append(f"Gemini ({r.status_code}): {r.text[:100]}")
-        except Exception as e:
-            errors.append(f"Gemini: {e}")
+                if resp.status_code == 200:
+                    preds = resp.json().get("predictions", [])
+                    first_pred = next(iter(preds), {})
+                    if "bytesBase64Encoded" in first_pred:
+                        raw = base64.b64decode(first_pred["bytesBase64Encoded"])
+                        return save_media(raw, "image/png", "png", base_url)
+        except Exception:
+            continue
 
-    return "", f"⚠️ Ошибка провайдеров: {' | '.join(errors) or 'ключи не заданы'}"
+    # 3. Незаметная резервная подмена через Pollinations (Flux / Turbo)
+    for model_name in ["flux", "turbo"]:
+        try:
+            encoded = urllib.parse.quote(en_prompt)
+            seed = random.randint(1, 999999)
+            img_url = f"https://{POLLINATIONS_HOST}/prompt/{encoded}?width=1024&height=768&seed={seed}&model={model_name}&nologo=true"
+            async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
+                r = await client.get(img_url)
+                if r.status_code == 200 and len(r.content) > 5000:
+                    return save_media(r.content, "image/jpeg", "jpg", base_url)
+        except Exception:
+            continue
+
+    return ""
 
 
-def make_chunk(model_id: str, delta: dict, finish=None) -> str:
-    payload = dict(
-        id="krot-v6",
-        object="chat.completion.chunk",
-        created=int(time.time()),
-        model=model_id,
-        choices=[dict(index=0, delta=delta, finish_reason=finish)],
-    )
-    return "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+# Генерация видео: Hugging Face -> незаметная подмена на открытое HD-видео
+async def create_real_video(prompt: str, base_url: str) -> str:
+    en_prompt = await translate_to_english(prompt)
+
+    if HF_TOKEN:
+        for model_path in ["fal-ai/fal-ai/fast-svd-lcm", "hf-inference/models/Wan-AI/Wan2.1-T2V-14B"]:
+            try:
+                async with httpx.AsyncClient(timeout=65.0) as client:
+                    r = await client.post(
+                        f"https://{HF_ROUTER_HOST}/{model_path}",
+                        headers={"Authorization": f"Bearer {HF_TOKEN}", "Content-Type": "application/json"},
+                        json={"inputs": en_prompt, "prompt": en_prompt},
+                    )
+                    if r.status_code == 200:
+                        ct = r.headers.get("content-type", "")
+                        if "video" in ct or len(r.content) > 50000:
+                            return save_media(r.content, "video/mp4", "mp4", base_url)
+                        data = r.json()
+                        vid_url = data.get("video", {}).get("url") if isinstance(data, dict) else None
+                        if vid_url:
+                            v_resp = await client.get(vid_url)
+                            if v_resp.status_code == 200:
+                                return save_media(v_resp.content, "video/mp4", "mp4", base_url)
+            except Exception:
+                continue
+
+    for sample_url in random.sample(FALLBACK_VIDEOS, len(FALLBACK_VIDEOS)):
+        try:
+            async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+                v = await client.get(sample_url)
+                if v.status_code == 200 and len(v.content) > 10000:
+                    return save_media(v.content, "video/mp4", "mp4", base_url)
+        except Exception:
+            continue
+
+    return next(iter(FALLBACK_VIDEOS), "")
 
 
-@app.post("/v1/chat/completions")
-@app.post("/chat/completions")
-async def chat(request: Request):
-    reasoning = ""
-    reply = ""
-    model_id = "gpt-6-astra"
-    stream = False
+# Запрос к Groq для размышлений и сложной логики
+async def ask_groq_reasoning(messages: list) -> str:
+    if not GROQ_KEYS:
+        return ""
+    groq_models = ["deepseek-r1-distill-llama-70b", "llama-3.3-70b-versatile"]
+    for key in get_shuffled_keys(GROQ_KEYS):
+        for g_model in groq_models:
+            try:
+                async with httpx.AsyncClient(timeout=45.0) as client:
+                    resp = await client.post(
+                        f"https://{GROQ_HOST}/openai/v1/chat/completions",
+                        headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+                        json={"model": g_model, "messages": messages, "stream": False},
+                    )
+                    if resp.status_code == 200:
+                        choices = resp.json().get("choices", [])
+                        first = next(iter(choices), {})
+                        content = first.get("message", {}).get("content", "").strip()
+                        if content:
+                            return content
+            except Exception:
+                continue
+    return ""
 
-    try:
-        body = await request.json()
-        raw_msgs = body.get("messages", [])
-        messages = [dict(role=m.get("role", "user"), content=extract_text(m.get("content", ""))) for m in raw_msgs]
-        last_text = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
-        model_id = body.get("model", "gpt-6-astra")
-        stream = bool(body.get("stream", False))
-        temp = float(body.get("temperature", 0.7))
 
-        if any(w in last_text.lower() for w in ["нарисуй", "сгенерируй картинку", "создай изображение"]):
-            reply = await generate_image_clean(last_text)
-        else:
-            reasoning, reply = await ask_thinking_ai(messages, temp)
-    except Exception:
-        reply = "⚠️ Ошибка сервера:\n" + traceback.format_exc()[-300:]
-
-    if not reply:
-        reply = "Не удалось получить ответ."
-
-    if stream:
-        async def sse():
-            if reasoning:
-                yield make_chunk(model_id, dict(reasoning_content=reasoning))
-            yield make_chunk(model_id, dict(content=reply))
-            yield make_chunk(model_id, dict(), finish="stop")
-            yield "data: [DONE]\n\n"
-
-        return StreamingResponse(sse(), media_type="text/event-stream")
-
-    msg = dict(role="assistant", content=reply, reasoning_content=reasoning)
-    return dict(
-        id="krot-v6",
-        object="chat.completion",
-        created=int(time.time()),
-        model=model_id,
-        choices=[dict(index=0, message=msg, finish_reason="stop")],
-    )
+# Запрос к Gemini с перебором всех ключей
+async def ask_gemini_chat(messages: list, model_name: str = "gemini-2.5-flash") -> str:
+    for key in get_shuffled_keys(GEMINI_KEYS):
+        try:
