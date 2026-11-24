@@ -9,7 +9,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="KROT GPT Clean API v6.4")
+app = FastAPI(title="KROT GPT Clean API v6.5")
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,24 +30,13 @@ HORDE_BASE = "/".join(["https:/", "stablehorde.net", "api", "v2", "generate"])
 
 @app.get("/")
 async def health():
-    return {
-        "status": "online",
-        "version": "6.4-clean",
-        "groq": bool(GROQ_API_KEY),
-        "gemini": bool(GEMINI_API_KEY),
-    }
+    return dict(status="online", version="6.5", groq=bool(GROQ_API_KEY), gemini=bool(GEMINI_API_KEY))
 
 
 @app.get("/v1/models")
 @app.get("/models")
 async def models():
-    return {
-        "object": "list",
-        "data": [
-            {"id": "gpt-6-astra", "object": "model", "owned_by": "krot"},
-            {"id": "gemini-thinking", "object": "model", "owned_by": "krot"},
-        ],
-    }
+    return dict(object="list", data=[dict(id="gpt-6-astra", object="model", owned_by="krot")])
 
 
 def extract_text(content):
@@ -63,7 +52,7 @@ def first_dict(lst):
         for item in lst:
             if isinstance(item, dict):
                 return item
-    return {}
+    return dict()
 
 
 async def translate_prompt(text: str) -> str:
@@ -73,18 +62,18 @@ async def translate_prompt(text: str) -> str:
         async with httpx.AsyncClient(timeout=15.0) as client:
             r = await client.post(
                 GROQ_URL,
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                json={
-                    "model": "llama-3.1-8b-instant",
-                    "messages": [
-                        {"role": "system", "content": "Translate to detailed English image prompt. Output ONLY English text."},
-                        {"role": "user", "content": text},
+                headers=dict(Authorization=f"Bearer {GROQ_API_KEY}"),
+                json=dict(
+                    model="llama-3.1-8b-instant",
+                    messages=[
+                        dict(role="system", content="Translate to detailed English image prompt. Output ONLY English text."),
+                        dict(role="user", content=text),
                     ],
-                },
+                ),
             )
             if r.status_code == 200:
                 choice = first_dict(r.json().get("choices", []))
-                return choice.get("message", {}).get("content", text).strip()
+                return choice.get("message", dict()).get("content", text).strip()
     except Exception:
         pass
     return text
@@ -94,13 +83,12 @@ async def generate_image_clean(prompt: str) -> str:
     en_prompt = await translate_prompt(prompt)
     errors = []
 
-    # 1. Google Imagen 3 (если задан GEMINI_API_KEY)
     if GEMINI_API_KEY:
         try:
             async with httpx.AsyncClient(timeout=45.0) as client:
                 r = await client.post(
                     f"{GEMINI_IMG_BASE}?key={GEMINI_API_KEY}",
-                    json={"instances": [{"prompt": en_prompt}], "parameters": {"sampleCount": 1}},
+                    json=dict(instances=[dict(prompt=en_prompt)], parameters=dict(sampleCount=1)),
                 )
                 if r.status_code == 200:
                     pred = first_dict(r.json().get("predictions", []))
@@ -111,13 +99,12 @@ async def generate_image_clean(prompt: str) -> str:
         except Exception as e:
             errors.append(f"Imagen: {e}")
 
-    # 2. Бесплатная сеть AI Horde (FLUX.1-schnell без водяных знаков)
-    headers = {"apikey": "0000000000", "Client-Agent": "KrotGPT:6.4:admin"}
-    payload = {
-        "prompt": en_prompt,
-        "params": {"width": 1024, "height": 1024, "steps": 4, "n": 1},
-        "models": ["Flux.1-Schnell fp8", "AlbedoBase XL (SDXL)"],
-    }
+    headers = {"apikey": "0000000000", "Client-Agent": "KrotGPT:6.5:admin"}
+    payload = dict(
+        prompt=en_prompt,
+        params=dict(width=1024, height=1024, steps=4, n=1),
+        models=["Flux.1-Schnell fp8", "AlbedoBase XL (SDXL)"],
+    )
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             r = await client.post(f"{HORDE_BASE}/async", json=payload, headers=headers)
@@ -146,30 +133,27 @@ async def generate_image_clean(prompt: str) -> str:
 
 
 async def ask_thinking_ai(messages: list, temp: float) -> tuple[str, str]:
-    system_msg = {
-        "role": "system",
-        "content": "Ты глубоко мыслящий ИИ-ассистент KROT GPT. Проводи подробный, глубокий разбор задачи на русском языке.",
-    }
-    full_msgs = [system_msg] + messages
+    sys_msg = dict(role="system", content="Ты глубоко мыслящий ИИ KROT GPT. Проводи подробный, глубокий анализ на русском языке.")
+    full_msgs = [sys_msg] + messages
     errors = []
 
     if GROQ_API_KEY:
-        headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+        headers = dict(Authorization=f"Bearer {GROQ_API_KEY}")
         async with httpx.AsyncClient(timeout=60.0) as client:
             try:
                 r = await client.post(
                     GROQ_URL,
                     headers=headers,
-                    json={
-                        "model": "openai/gpt-oss-120b",
-                        "messages": full_msgs,
-                        "reasoning_format": "parsed",
-                        "reasoning_effort": "high",
-                        "temperature": temp,
-                    },
+                    json=dict(
+                        model="openai/gpt-oss-120b",
+                        messages=full_msgs,
+                        reasoning_format="parsed",
+                        reasoning_effort="high",
+                        temperature=temp,
+                    ),
                 )
                 if r.status_code == 200:
-                    msg = first_dict(r.json().get("choices", [])).get("message", {})
+                    msg = first_dict(r.json().get("choices", [])).get("message", dict())
                     return str(msg.get("reasoning") or ""), str(msg.get("content") or "")
                 errors.append(f"Groq oss ({r.status_code}): {r.text[:100]}")
             except Exception as e:
@@ -179,10 +163,10 @@ async def ask_thinking_ai(messages: list, temp: float) -> tuple[str, str]:
                 r2 = await client.post(
                     GROQ_URL,
                     headers=headers,
-                    json={"model": "llama-3.3-70b-versatile", "messages": full_msgs, "temperature": temp},
+                    json=dict(model="llama-3.3-70b-versatile", messages=full_msgs, temperature=temp),
                 )
                 if r2.status_code == 200:
-                    msg2 = first_dict(r2.json().get("choices", [])).get("message", {})
+                    msg2 = first_dict(r2.json().get("choices", [])).get("message", dict())
                     return "", str(msg2.get("content") or "")
                 errors.append(f"Groq llama ({r2.status_code}): {r2.text[:100]}")
             except Exception as e:
@@ -194,17 +178,28 @@ async def ask_thinking_ai(messages: list, temp: float) -> tuple[str, str]:
             async with httpx.AsyncClient(timeout=60.0) as client:
                 r = await client.post(
                     f"{GEMINI_CHAT_BASE}?key={GEMINI_API_KEY}",
-                    json={"contents": [{"parts": [{"text": user_prompt}]}]},
+                    json=dict(contents=[dict(parts=[dict(text=user_prompt)])]),
                 )
                 if r.status_code == 200:
                     cand = first_dict(r.json().get("candidates", []))
-                    part = first_dict(cand.get("content", {}).get("parts", []))
+                    part = first_dict(cand.get("content", dict()).get("parts", []))
                     return "", str(part.get("text") or "")
                 errors.append(f"Gemini ({r.status_code}): {r.text[:100]}")
         except Exception as e:
             errors.append(f"Gemini: {e}")
 
     return "", f"⚠️ Ошибка провайдеров: {' | '.join(errors) or 'ключи не заданы'}"
+
+
+def make_chunk(model_id: str, delta: dict, finish=None) -> str:
+    payload = dict(
+        id="krot-v6",
+        object="chat.completion.chunk",
+        created=int(time.time()),
+        model=model_id,
+        choices=[dict(index=0, delta=delta, finish_reason=finish)],
+    )
+    return "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
 
 
 @app.post("/v1/chat/completions")
@@ -218,7 +213,7 @@ async def chat(request: Request):
     try:
         body = await request.json()
         raw_msgs = body.get("messages", [])
-        messages = [{"role": m.get("role", "user"), "content": extract_text(m.get("content", ""))} for m in raw_msgs]
+        messages = [dict(role=m.get("role", "user"), content=extract_text(m.get("content", ""))) for m in raw_msgs]
         last_text = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
         model_id = body.get("model", "gpt-6-astra")
         stream = bool(body.get("stream", False))
@@ -229,25 +224,26 @@ async def chat(request: Request):
         else:
             reasoning, reply = await ask_thinking_ai(messages, temp)
     except Exception:
-        reply = f"⚠️ Внутренняя ошибка сервера:\n```\n{traceback.format_exc()[-400:]}\n```"
+        reply = "⚠️ Ошибка сервера:\n" + traceback.format_exc()[-300:]
 
     if not reply:
-        reply = "Не удалось получить ответ от нейросети."
+        reply = "Не удалось получить ответ."
 
     if stream:
         async def sse():
             if reasoning:
-                chunk_r = {
-                    "id": "krot-v6",
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": model_id,
-                    "choices": [{"index": 0, "delta": {"reasoning_content": reasoning}, "finish_reason": None}],
-                }
-                yield f"data: {json.dumps(chunk_r, ensure_ascii=False)}\n\n"
+                yield make_chunk(model_id, dict(reasoning_content=reasoning))
+            yield make_chunk(model_id, dict(content=reply))
+            yield make_chunk(model_id, dict(), finish="stop")
+            yield "data: [DONE]\n\n"
 
-            chunk_c = {
-                "id": "krot-v6",
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": model_id,
+        return StreamingResponse(sse(), media_type="text/event-stream")
+
+    msg = dict(role="assistant", content=reply, reasoning_content=reasoning)
+    return dict(
+        id="krot-v6",
+        object="chat.completion",
+        created=int(time.time()),
+        model=model_id,
+        choices=[dict(index=0, message=msg, finish_reason="stop")],
+    )
